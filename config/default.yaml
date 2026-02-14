@@ -1,0 +1,207 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRADING TOOLKIT - Default Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Data settings
+data:
+  symbol: "SPY"
+  interval: "1d"  # 1m, 5m, 15m, 30m, 1h, 1d
+  start_date: "2020-01-01"
+  end_date: "2024-01-01"
+
+# Backtest settings
+backtest:
+  initial_capital: 10000
+  commission_percent: 0.1
+  slippage_percent: 0.05
+  trade_direction: "long_only"  # long_only, short_only, both
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CORE INDICATORS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# PAMRP Settings
+pamrp:
+  length: 21
+  entry_long: 20      # Oversold threshold
+  entry_short: 80     # Overbought threshold
+  exit_long: 70       # Exit long when overbought
+  exit_short: 30      # Exit short when oversold
+
+# BBWP Settings
+bbwp:
+  length: 13
+  lookback: 252
+  sma_length: 5
+  threshold_long: 50
+  threshold_short: 50
+  ma_filter: "disabled"  # decreasing, increasing, any, disabled
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENTRY FILTERS (all can be enabled/disabled)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ADX Filter
+adx:
+  enabled: false
+  length: 14
+  smoothing: 14
+  threshold: 20
+  require_di_direction: false
+
+# MA Trend Filter
+ma_trend:
+  enabled: false
+  fast_length: 50
+  slow_length: 200
+  ma_type: "sma"  # sma, ema, wma, rma
+
+# RSI Filter
+rsi:
+  enabled: false
+  length: 14
+  oversold: 30
+  overbought: 70
+
+# Volume Filter
+volume:
+  enabled: false
+  ma_length: 20
+  multiplier: 1.0
+
+# Supertrend Filter
+supertrend:
+  enabled: false
+  period: 10
+  multiplier: 3.0
+
+# VWAP Filter
+vwap:
+  enabled: false
+
+# MACD Filter
+macd:
+  enabled: false
+  fast: 12
+  slow: 26
+  signal: 9
+  mode: "histogram"  # histogram, crossover, zero
+
+# Session Filter
+session:
+  enabled: false
+  start: 930   # HHMM format
+  end: 1600    # HHMM format
+
+# HTF Confirmation
+htf:
+  enabled: false
+  timeframe: "D"
+  pamrp_long: 30
+  pamrp_short: 70
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXIT METHODS (all can be enabled/disabled)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Stop Loss
+stop_loss:
+  enabled: true
+  percent_long: 3.0
+  percent_short: 3.0
+
+# Take Profit
+take_profit:
+  enabled: false
+  percent_long: 5.0
+  percent_short: 5.0
+
+# Trailing Stop (Percent-based)
+trailing_stop:
+  enabled: false
+  percent: 2.0
+  activation: 1.0
+
+# ATR Trailing Stop
+atr_trailing:
+  enabled: false
+  length: 14
+  multiplier: 2.0
+
+# PAMRP Exit
+pamrp_exit:
+  enabled: true
+  # Uses pamrp.exit_long and pamrp.exit_short above
+
+# Stochastic RSI Exit
+stoch_rsi_exit:
+  enabled: false
+  length: 14
+  k_smooth: 3
+  d_smooth: 3
+  overbought: 80
+  oversold: 20
+
+# Time-based Exit
+time_exit:
+  enabled: false
+  max_bars_long: 20
+  max_bars_short: 20
+
+# MA Cross Exit
+ma_exit:
+  enabled: false
+  fast_length: 10
+  slow_length: 20
+
+# BBWP Exit
+bbwp_exit:
+  enabled: false
+  threshold: 80
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OPTIMIZATION SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+optimization:
+  method: "bayesian"  # bayesian, grid
+  metric: "sharpe_ratio"  # sharpe_ratio, total_return, profit_factor, win_rate
+  n_trials: 200
+  min_trades: 10
+  n_jobs: -1  # -1 = use all cores
+  
+  # Parameter ranges for optimization
+  param_ranges:
+    pamrp_entry_long: [15, 40]
+    pamrp_entry_short: [60, 85]
+    pamrp_exit_long: [55, 85]
+    pamrp_exit_short: [15, 45]
+    bbwp_threshold: [40, 70]
+    stop_loss_percent: [1.0, 8.0]
+    take_profit_percent: [2.0, 15.0]
+    atr_multiplier: [1.0, 4.0]
+    
+  # Toggles to test
+  test_toggles:
+    - adx_enabled
+    - ma_trend_enabled
+    - rsi_enabled
+    - supertrend_enabled
+    - vwap_enabled
+    - macd_enabled
+    - stop_loss_enabled
+    - take_profit_enabled
+    - trailing_stop_enabled
+    - atr_trailing_enabled
+    - pamrp_exit_enabled
+    - stoch_rsi_exit_enabled
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REPORT SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+report:
+  output_dir: "reports"
+  generate_html: true
+  include_charts: true
+  include_trade_log: true
