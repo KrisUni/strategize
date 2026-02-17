@@ -756,6 +756,17 @@ with tabs[4]:
 
             # Trade calendar (if backtest was run)
             tcal = st.session_state.get('_trade_calendar')
+
+            # Hourly stats (only shown for intraday data)
+            if cal.is_intraday and cal.hourly_df is not None and not cal.hourly_df.empty:
+                st.markdown("### ⏰ Hourly Returns (Intraday)")
+                st.caption("Average per-bar return by hour of day")
+                hdf = cal.hourly_df
+                colors = ['#ef4444' if v < 0 else '#10b981' for v in hdf['Avg %']]
+                fig = go.Figure(go.Bar(x=hdf['Hour'], y=hdf['Avg %'], marker_color=colors))
+                fig.update_layout(**_chart_layout(200), xaxis_title='Hour', yaxis_title='Avg %')
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(hdf, use_container_width=True, hide_index=True)
             if tcal and not tcal.trades_by_day.empty:
                 st.markdown("### 📊 Trade Performance by Entry Day")
                 st.caption("How your strategy's trades performed based on entry day")
