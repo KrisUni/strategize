@@ -409,9 +409,9 @@ with st.sidebar:
     # yfinance API hard limits per interval (calendar days)
     _INTERVAL_MAX_DAYS = {
         '1m': 7, '2m': 60, '5m': 60, '15m': 60, '30m': 60,
-        '60m': 730, '90m': 60, '1h': 730,
+        '90m': 60, '1h': 730,
     }
-    INTERVALS = ["1m","2m","5m","15m","30m","60m","90m","1h","1d","5d","1wk","1mo","3mo"]
+    INTERVALS = ["1m","2m","5m","15m","30m","90m","1h","1d","5d","1wk","1mo","3mo"]
 
     symbol, interval, days = "SPY", "1d", 730
     uploaded_file = None
