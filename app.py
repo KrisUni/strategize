@@ -1,11 +1,15 @@
 """
-Trading Toolkit - Premium UI v6
+Trading Toolkit - Premium UI v7
 ================================
-Changes from v5.1:
-- Mark-to-market equity curve with new metrics (CAGR, Calmar, Expectancy, MAE/MFE)
-- Enhanced Monte Carlo: 3 methods, equity confidence bands, risk of ruin
-- New Calendar Analytics tab (day-of-week, monthly seasonality, trade calendar)
-- Backtest metrics row expanded
+Changes from v6:
+- Optimize tab updated for optimize module v8:
+  - `best_results` → `full_data_results` throughout
+  - Window type selector (rolling / anchored) when WFO enabled
+  - Train window bars slider when rolling mode selected
+  - Robustness warnings displayed as expandable alert
+  - Efficiency ratio surfaced as dedicated metric
+  - Stitched OOS equity chart for WFO (authoritative performance view)
+  - Trial budget recommendations displayed inline
 """
 
 import streamlit as st
@@ -186,7 +190,7 @@ def calculate_beta_alpha(strategy_returns, benchmark_returns):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PARAM WIDGET KEY MAPPING (same as v5.1)
+# PARAM WIDGET KEY MAPPING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 PARAM_TO_WIDGET_KEY = {
@@ -238,7 +242,7 @@ def _chart_layout(height=280, **kwargs):
     defaults = dict(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)',
                     plot_bgcolor='rgba(10,14,20,0.8)', height=height, showlegend=False,
                     margin=dict(l=50, r=20, t=10, b=30), font=dict(size=9))
-    defaults.update(kwargs)  # kwargs override defaults
+    defaults.update(kwargs)
     return defaults
 
 def create_price_chart_with_trades(df, trades=None):
@@ -264,7 +268,6 @@ def create_equity_chart(results):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
     fig.add_trace(go.Scatter(x=results.equity_curve.index, y=results.equity_curve.values, mode='lines',
         line=dict(color='#3b82f6', width=2), fill='tozeroy', fillcolor='rgba(59,130,246,0.1)', name='MTM Equity'), row=1, col=1)
-    # Show realized equity as thinner line
     fig.add_trace(go.Scatter(x=results.realized_equity.index, y=results.realized_equity.values, mode='lines',
         line=dict(color='#64748b', width=1, dash='dot'), name='Realized'), row=1, col=1)
     peak = results.equity_curve.expanding().max()
@@ -275,56 +278,27 @@ def create_equity_chart(results):
     fig.update_xaxes(gridcolor='rgba(45,53,72,0.3)'); fig.update_yaxes(gridcolor='rgba(45,53,72,0.3)')
     return fig
 
-def create_mc_confidence_chart(mc: MonteCarloResult):
-    """Equity confidence band chart from Monte Carlo."""
-    fig = go.Figure()
-    n_steps = len(mc.equity_bands.get('50%', []))
-    x = list(range(n_steps))
-    # 5-95% band
-    if '5%' in mc.equity_bands and '95%' in mc.equity_bands:
-        fig.add_trace(go.Scatter(x=x, y=mc.equity_bands['95%'], mode='lines', line=dict(width=0), showlegend=False))
-        fig.add_trace(go.Scatter(x=x, y=mc.equity_bands['5%'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(59,130,246,0.15)', name='5-95%'))
-    # 25-75% band
-    if '25%' in mc.equity_bands and '75%' in mc.equity_bands:
-        fig.add_trace(go.Scatter(x=x, y=mc.equity_bands['75%'], mode='lines', line=dict(width=0), showlegend=False))
-        fig.add_trace(go.Scatter(x=x, y=mc.equity_bands['25%'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(59,130,246,0.3)', name='25-75%'))
-    # Median
-    if '50%' in mc.equity_bands:
-        fig.add_trace(go.Scatter(x=x, y=mc.equity_bands['50%'], mode='lines', line=dict(color='#3b82f6', width=2), name='Median'))
-    fig.update_layout(**_chart_layout(250, showlegend=True, legend=dict(orientation='h', y=1.12, font=dict(size=8))))
-    fig.update_xaxes(title_text='Step', gridcolor='rgba(45,53,72,0.3)')
-    fig.update_yaxes(title_text='Equity $', gridcolor='rgba(45,53,72,0.3)')
-    return fig
-
-def create_mc_histogram(values, title='', xaxis_title=''):
-    fig = go.Figure()
-    fig.add_trace(go.Histogram(x=values, nbinsx=50, marker_color='#3b82f6', opacity=0.7))
-    p5 = np.percentile(values, 5); p50 = np.percentile(values, 50); p95 = np.percentile(values, 95)
-    for val, label, color in [(p5, '5%', '#64748b'), (p50, '50%', '#f59e0b'), (p95, '95%', '#64748b')]:
-        fig.add_vline(x=val, line_dash='dash', line_color=color, annotation_text=f"{label}: {val:,.0f}" if abs(val)>100 else f"{label}: {val:.1f}%")
-    fig.update_layout(**_chart_layout(220), xaxis_title=xaxis_title)
-    return fig
-
-def create_dow_chart(dow_df):
-    """Day-of-week bar chart."""
-    if dow_df.empty: return go.Figure()
-    colors = ['#ef4444' if v < 0 else '#10b981' for v in dow_df['Avg %']]
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=dow_df['Day'], y=dow_df['Avg %'], marker_color=colors, text=[f"{v:+.4f}%" for v in dow_df['Avg %']], textposition='outside'))
-    fig.update_layout(**_chart_layout(250), yaxis_title='Avg Return %')
-    fig.update_xaxes(type='category', fixedrange=True)
-    fig.update_yaxes(fixedrange=True)
-    return fig
-
-def create_monthly_heatmap(heatmap_df):
-    """Year x Month heatmap."""
-    if heatmap_df.empty: return go.Figure()
-    fig = go.Figure(data=go.Heatmap(
-        z=heatmap_df.values, x=heatmap_df.columns.tolist(),
-        y=[str(y) for y in heatmap_df.index], colorscale='RdYlGn', zmid=0,
-        text=np.round(heatmap_df.values, 2), texttemplate='%{text:.1f}%', showscale=True
-    ))
-    fig.update_layout(**_chart_layout(max(200, len(heatmap_df) * 35)))
+def create_stitched_equity_chart(equity: pd.Series):
+    """
+    Render the stitched OOS equity curve from WFO.
+    This is the authoritative unbiased performance view — each segment
+    is a genuine out-of-sample period with no IS contamination.
+    """
+    if equity is None or len(equity) == 0:
+        return go.Figure()
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.7, 0.3])
+    fig.add_trace(go.Scatter(x=equity.index, y=equity.values, mode='lines',
+        line=dict(color='#10b981', width=2), fill='tozeroy',
+        fillcolor='rgba(16,185,129,0.1)', name='Stitched OOS'), row=1, col=1)
+    peak = equity.expanding().max()
+    dd = (equity - peak) / peak * 100
+    fig.add_trace(go.Scatter(x=dd.index, y=dd.values, mode='lines',
+        line=dict(color='#ef4444', width=2), fill='tozeroy',
+        fillcolor='rgba(239,68,68,0.15)', name='Drawdown'), row=2, col=1)
+    fig.update_layout(**_chart_layout(280, showlegend=True,
+        legend=dict(orientation='h', y=1.12, font=dict(size=8))))
+    fig.update_xaxes(gridcolor='rgba(45,53,72,0.3)')
+    fig.update_yaxes(gridcolor='rgba(45,53,72,0.3)')
     return fig
 
 def create_walkforward_chart(wf_folds):
@@ -332,7 +306,7 @@ def create_walkforward_chart(wf_folds):
     folds = [f"Fold {f.fold_num}" for f in wf_folds]
     fig = go.Figure()
     fig.add_trace(go.Bar(x=folds, y=[f.train_value for f in wf_folds], name='Train', marker_color='#3b82f6', opacity=0.8))
-    fig.add_trace(go.Bar(x=folds, y=[f.test_value for f in wf_folds], name='Test', marker_color='#10b981', opacity=0.8))
+    fig.add_trace(go.Bar(x=folds, y=[f.test_value for f in wf_folds], name='OOS', marker_color='#10b981', opacity=0.8))
     fig.update_layout(**_chart_layout(250, showlegend=True, barmode='group', legend=dict(orientation='h', y=1.12), dragmode=False))
     fig.update_xaxes(type='category', fixedrange=True, categoryorder='array', categoryarray=folds)
     fig.update_yaxes(fixedrange=True)
@@ -373,9 +347,55 @@ def create_multi_asset_chart(results_dict):
     fig.update_layout(**_chart_layout(300, showlegend=True, legend=dict(orientation='h', y=1.1)), yaxis_title="Return %")
     return fig
 
+def create_mc_confidence_chart(mc: MonteCarloResult):
+    fig = go.Figure()
+    n_steps = len(mc.equity_bands.get('50%', []))
+    x = list(range(n_steps))
+    if '5%' in mc.equity_bands and '95%' in mc.equity_bands:
+        fig.add_trace(go.Scatter(x=x, y=mc.equity_bands['95%'], mode='lines', line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(x=x, y=mc.equity_bands['5%'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(59,130,246,0.15)', name='5-95%'))
+    if '25%' in mc.equity_bands and '75%' in mc.equity_bands:
+        fig.add_trace(go.Scatter(x=x, y=mc.equity_bands['75%'], mode='lines', line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(x=x, y=mc.equity_bands['25%'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(59,130,246,0.3)', name='25-75%'))
+    if '50%' in mc.equity_bands:
+        fig.add_trace(go.Scatter(x=x, y=mc.equity_bands['50%'], mode='lines', line=dict(color='#3b82f6', width=2), name='Median'))
+    fig.update_layout(**_chart_layout(250, showlegend=True, legend=dict(orientation='h', y=1.12, font=dict(size=8))))
+    fig.update_xaxes(title_text='Step', gridcolor='rgba(45,53,72,0.3)')
+    fig.update_yaxes(title_text='Equity $', gridcolor='rgba(45,53,72,0.3)')
+    return fig
+
+def create_mc_histogram(values, title='', xaxis_title=''):
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(x=values, nbinsx=50, marker_color='#3b82f6', opacity=0.7))
+    p5 = np.percentile(values, 5); p50 = np.percentile(values, 50); p95 = np.percentile(values, 95)
+    for val, label, color in [(p5, '5%', '#64748b'), (p50, '50%', '#f59e0b'), (p95, '95%', '#64748b')]:
+        fig.add_vline(x=val, line_dash='dash', line_color=color, annotation_text=f"{label}: {val:,.0f}" if abs(val)>100 else f"{label}: {val:.1f}%")
+    fig.update_layout(**_chart_layout(220), xaxis_title=xaxis_title)
+    return fig
+
+def create_dow_chart(dow_df):
+    if dow_df.empty: return go.Figure()
+    colors = ['#ef4444' if v < 0 else '#10b981' for v in dow_df['Avg %']]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=dow_df['Day'], y=dow_df['Avg %'], marker_color=colors, text=[f"{v:+.4f}%" for v in dow_df['Avg %']], textposition='outside'))
+    fig.update_layout(**_chart_layout(250), yaxis_title='Avg Return %')
+    fig.update_xaxes(type='category', fixedrange=True)
+    fig.update_yaxes(fixedrange=True)
+    return fig
+
+def create_monthly_heatmap(heatmap_df):
+    if heatmap_df.empty: return go.Figure()
+    fig = go.Figure(data=go.Heatmap(
+        z=heatmap_df.values, x=heatmap_df.columns.tolist(),
+        y=[str(y) for y in heatmap_df.index], colorscale='RdYlGn', zmid=0,
+        text=np.round(heatmap_df.values, 2), texttemplate='%{text:.1f}%', showscale=True
+    ))
+    fig.update_layout(**_chart_layout(max(200, len(heatmap_df) * 35)))
+    return fig
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR (same structure as v5.1 — abbreviated for brevity)
+# SIDEBAR
 # ═══════════════════════════════════════════════════════════════════════════════
 
 p = st.session_state.params
@@ -529,7 +549,6 @@ with tabs[0]:
                 st.success(f"✅ {st.session_state.backtest_results.num_trades} trades")
     if st.session_state.backtest_results:
         r = st.session_state.backtest_results
-        # Row 1: Core performance
         c1,c2,c3,c4,c5,c6 = st.columns(6)
         c1.metric("Return", f"{r.total_return_pct:.2f}%")
         c2.metric("CAGR", f"{r.cagr:.2f}%")
@@ -537,7 +556,6 @@ with tabs[0]:
         c4.metric("Sortino", f"{r.sortino_ratio:.3f}")
         c5.metric("Calmar", f"{r.calmar_ratio:.3f}")
         c6.metric("Max DD", f"{r.max_drawdown_pct:.2f}%")
-        # Row 2: Trade quality
         c1,c2,c3,c4,c5,c6 = st.columns(6)
         c1.metric("Trades", r.num_trades)
         c2.metric("Win%", f"{r.win_rate:.1f}%")
@@ -545,7 +563,6 @@ with tabs[0]:
         c4.metric("Expectancy", f"${r.expectancy:.2f}")
         c5.metric("Payoff", f"{r.payoff_ratio:.2f}")
         c6.metric("Mkt Time", f"{r.pct_time_in_market:.0f}%")
-        # Row 3: Trade details
         with st.expander("📊 Detailed Metrics", expanded=False):
             c1,c2,c3,c4,c5,c6 = st.columns(6)
             c1.metric("Avg Win", f"${r.avg_winner:.2f}")
@@ -567,55 +584,156 @@ with tabs[0]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# OPTIMIZE TAB
+# OPTIMIZE TAB  (v7: updated for optimize module v8)
 # ═══════════════════════════════════════════════════════════════════════════════
 with tabs[1]:
     st.markdown("### 🎯 Optimization")
+
+    # ── Row 1: core settings ──────────────────────────────────────────────────
     c1,c2,c3,c4 = st.columns(4)
     opt_metric = c1.selectbox("Metric", ["sharpe_ratio","total_return_pct","profit_factor","sortino_ratio"])
     opt_dir = c2.selectbox("Dir", ["long_only","short_only","both"])
-    opt_trials = c3.slider("Trials", 20, 300, 100)
+    opt_trials = c3.slider("Trials", 20, 500, 100)
     opt_min = c4.slider("Min Trades", 5, 30, 10)
+
+    # ── Row 2: split / WFO settings ──────────────────────────────────────────
     c1,c2,c3 = st.columns(3)
     train_pct = c1.slider("Train %", 50, 90, 70)
     use_wf = c2.toggle("Walk-Forward", False)
     n_folds = c3.slider("Folds", 3, 10, 5) if use_wf else 5
+
+    # ── Row 3: WFO-specific controls (only shown when WFO enabled) ────────────
+    window_type = 'rolling'
+    train_window_bars = None
+    if use_wf:
+        c1, c2, c3 = st.columns(3)
+        window_type = c1.selectbox(
+            "Window Type",
+            ["rolling", "anchored"],
+            index=0,
+            help="Rolling: fixed-size sliding window (recommended for non-stationary markets). "
+                 "Anchored: expanding from bar 0 (use when you believe the edge is stable across all history)."
+        )
+        if window_type == 'rolling' and st.session_state.df is not None:
+            default_bars = int(len(st.session_state.df) * train_pct / 100)
+            train_window_bars = c2.slider(
+                "Train Window (bars)",
+                min_value=50,
+                max_value=max(51, len(st.session_state.df) - 20),
+                value=min(default_bars, max(50, len(st.session_state.df) - 20)),
+                help="Number of bars in each fold's training window. "
+                     "Smaller = more responsive to recent regimes. "
+                     "Larger = more stable but slower to adapt."
+            )
+        elif window_type == 'rolling':
+            c2.caption("Load data to configure window size.")
+
+    # ── Active indicators display ─────────────────────────────────────────────
     active_display = get_active_filters_display(st.session_state.params)
-    if active_display: st.caption(f"🔍 Active: **{', '.join(active_display)}**")
+    if active_display:
+        st.caption(f"🔍 Active: **{', '.join(active_display)}**")
+
+    # ── Run button ────────────────────────────────────────────────────────────
     if st.button("🎯 Optimize", type="primary", use_container_width=True):
-        if st.session_state.df is None: st.warning("Load data first!")
+        if st.session_state.df is None:
+            st.warning("Load data first!")
         else:
             ef = {k: v for k, v in st.session_state.params.items() if k.endswith('_enabled')}
             with st.spinner("Optimizing..."):
-                res = optimize_strategy(df=st.session_state.df.copy(), enabled_filters=ef, metric=opt_metric,
-                    n_trials=opt_trials, min_trades=opt_min, initial_capital=st.session_state.capital,
-                    commission_pct=st.session_state.commission, trade_direction=opt_dir, train_pct=train_pct/100,
-                    use_walkforward=use_wf, n_folds=n_folds, show_progress=False)
-                st.session_state.optimization_results = res; st.success("✅ Done!")
+                res = optimize_strategy(
+                    df=st.session_state.df.copy(),
+                    enabled_filters=ef,
+                    metric=opt_metric,
+                    n_trials=opt_trials,
+                    min_trades=opt_min,
+                    initial_capital=st.session_state.capital,
+                    commission_pct=st.session_state.commission,
+                    trade_direction=opt_dir,
+                    train_pct=train_pct / 100,
+                    use_walkforward=use_wf,
+                    n_folds=n_folds,
+                    window_type=window_type,
+                    train_window_bars=train_window_bars,
+                    show_progress=False,
+                )
+                st.session_state.optimization_results = res
+                st.success("✅ Done!")
+
+    # ── Results display ───────────────────────────────────────────────────────
     if st.session_state.optimization_results:
         res = st.session_state.optimization_results
-        c1,c2,c3 = st.columns(3)
-        ml = res.metric.replace('_',' ').title()
+        ml = res.metric.replace('_', ' ').title()
+
+        # Warnings — shown first so user sees them before metrics
+        if res.warnings:
+            with st.expander(f"⚠️ {len(res.warnings)} Robustness Warning(s)", expanded=True):
+                for w in res.warnings:
+                    st.warning(w)
+
+        # Core metrics row
+        c1,c2,c3,c4 = st.columns(4)
         c1.metric(f"Train ({ml})", f"{res.train_value:.4f}")
-        c2.metric(f"Test ({ml})", f"{res.test_value:.4f}")
+        c2.metric(f"OOS ({ml})", f"{res.test_value:.4f}")
+
+        # Efficiency ratio: color-code the degradation
+        if res.train_value != 0 and res.efficiency_ratio != 0.0:
+            eff_label = f"{res.efficiency_ratio:.2f}"
+            eff_delta = None
+            if res.efficiency_ratio < 0.5:
+                c3.metric("Efficiency (OOS/IS)", eff_label, delta="⚠ Overfit risk", delta_color="inverse")
+            else:
+                c3.metric("Efficiency (OOS/IS)", eff_label, delta="✓ Acceptable", delta_color="normal")
+        else:
+            c3.metric("Efficiency (OOS/IS)", "—")
+
         if res.train_value > 0:
             deg = ((res.train_value - res.test_value) / res.train_value) * 100
-            c3.metric("Degradation", f"{deg:.1f}%", delta_color="normal" if deg < 30 else "inverse")
+            c4.metric("IS→OOS Degradation", f"{deg:.1f}%",
+                      delta_color="normal" if deg < 30 else "inverse")
+
+        # Walk-forward fold chart + stitched equity
         if res.walkforward_folds:
-            st.plotly_chart(create_walkforward_chart(res.walkforward_folds), use_container_width=True, config={'displayModeBar': False})
-        c1,c2 = st.columns(2)
+            st.markdown("#### Walk-Forward Fold Performance")
+            st.caption(f"Window: **{res.window_type}** | Folds: **{len(res.walkforward_folds)}**")
+            st.plotly_chart(create_walkforward_chart(res.walkforward_folds),
+                            use_container_width=True, config={'displayModeBar': False})
+
+            # Stitched OOS equity — the authoritative performance chart for WFO
+            if res.stitched_equity is not None and len(res.stitched_equity) > 0:
+                st.markdown("#### 📈 Stitched OOS Equity Curve")
+                st.caption(
+                    "Each segment is a genuine out-of-sample period. "
+                    "This is the only unbiased performance representation for walk-forward optimization."
+                )
+                st.plotly_chart(create_stitched_equity_chart(res.stitched_equity),
+                                use_container_width=True)
+
+        # Best params + full-data performance
+        c1, c2 = st.columns(2)
         with c1:
             st.markdown("### Best Params")
-            st.dataframe(pd.DataFrame([{"P": k, "V": str(v)[:20]} for k, v in res.best_params.items()
-                if not k.startswith('trade_direction') and not isinstance(v, TradeDirection)]), use_container_width=True, hide_index=True, height=250)
+            st.dataframe(pd.DataFrame([{"Parameter": k, "Value": str(v)[:25]}
+                for k, v in res.best_params.items()
+                if not k.startswith('trade_direction') and not isinstance(v, TradeDirection)]),
+                use_container_width=True, hide_index=True, height=250)
         with c2:
-            br = res.best_results
+            # v8: renamed from best_results → full_data_results
+            br = res.full_data_results
             st.markdown("### Full-Data Performance")
-            st.dataframe(pd.DataFrame([{"Metric": "Return", "Value": f"{br.total_return_pct:.2f}%"},
-                {"Metric": "CAGR", "Value": f"{br.cagr:.2f}%"}, {"Metric": "Sharpe", "Value": f"{br.sharpe_ratio:.3f}"},
-                {"Metric": "Max DD", "Value": f"{br.max_drawdown_pct:.2f}%"}, {"Metric": "Trades", "Value": str(br.num_trades)}]),
-                use_container_width=True, hide_index=True)
-        st.plotly_chart(create_optimization_chart(res.all_trials, res.metric), use_container_width=True)
+            st.caption("⚠ Includes in-sample periods. For WFO, refer to the stitched OOS chart above.")
+            st.dataframe(pd.DataFrame([
+                {"Metric": "Return",   "Value": f"{br.total_return_pct:.2f}%"},
+                {"Metric": "CAGR",     "Value": f"{br.cagr:.2f}%"},
+                {"Metric": "Sharpe",   "Value": f"{br.sharpe_ratio:.3f}"},
+                {"Metric": "Max DD",   "Value": f"{br.max_drawdown_pct:.2f}%"},
+                {"Metric": "Trades",   "Value": str(br.num_trades)},
+            ]), use_container_width=True, hide_index=True)
+
+        # Trial convergence chart (simple split only — WFO has no single trial list)
+        if not res.all_trials.empty:
+            st.plotly_chart(create_optimization_chart(res.all_trials, res.metric),
+                            use_container_width=True)
+
         st.button("📋 Apply Best Params", on_click=apply_best_params_callback, use_container_width=True)
         if st.session_state.pop('_apply_success', False):
             st.success(f"✅ Applied! Capital: ${st.session_state.capital:,.0f} | Commission: {st.session_state.commission}%")
@@ -649,56 +767,36 @@ with tabs[2]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MONTE CARLO TAB — ENHANCED
+# MONTE CARLO TAB
 # ═══════════════════════════════════════════════════════════════════════════════
 with tabs[3]:
     st.markdown("### 🎲 Monte Carlo Simulation")
-
     c1, c2, c3 = st.columns(3)
     mc_method = c1.selectbox("Method", ["Trade Shuffle", "Return Bootstrap", "Noise Injection"])
     n_sims = c2.slider("Simulations", 100, 5000, 1000)
     ruin_pct = c3.slider("Ruin Threshold %", 10, 90, 50)
-
     method_map = {"Trade Shuffle": "trade_shuffle", "Return Bootstrap": "return_bootstrap", "Noise Injection": "noise_injection"}
     method_key = method_map[mc_method]
-
     extra_kwargs = {}
-    if method_key == 'noise_injection':
-        extra_kwargs['noise_pct'] = st.slider("Noise %", 5.0, 50.0, 20.0, 5.0)
-    if method_key == 'return_bootstrap':
-        extra_kwargs['block_size'] = st.slider("Block Size", 1, 20, 5)
-
+    if method_key == 'noise_injection': extra_kwargs['noise_pct'] = st.slider("Noise %", 5.0, 50.0, 20.0, 5.0)
+    if method_key == 'return_bootstrap': extra_kwargs['block_size'] = st.slider("Block Size", 1, 20, 5)
     if st.button("🎲 Run Monte Carlo", use_container_width=True):
         r = st.session_state.backtest_results
         if r and r.trades:
             with st.spinner(f"Running {n_sims} {mc_method} simulations..."):
-                mc = run_monte_carlo(
-                    trades=r.trades,
-                    equity_curve=r.equity_curve,
-                    method=method_key,
-                    n_simulations=n_sims,
-                    initial_capital=st.session_state.capital,
-                    ruin_pct=ruin_pct,
-                    bars_per_year=r.bars_per_year,
-                    **extra_kwargs
-                )
-                if mc:
-                    st.session_state._mc_result = mc
-
+                mc = run_monte_carlo(trades=r.trades, equity_curve=r.equity_curve, method=method_key,
+                    n_simulations=n_sims, initial_capital=st.session_state.capital, ruin_pct=ruin_pct,
+                    bars_per_year=r.bars_per_year, **extra_kwargs)
+                if mc: st.session_state._mc_result = mc
     mc = st.session_state.get('_mc_result')
     if mc:
-        # Key stats
         c1,c2,c3,c4 = st.columns(4)
         c1.metric("Risk of Ruin", f"{mc.risk_of_ruin:.1%}")
         c2.metric("5th Pctl", f"${mc.equity_percentiles['5%']:,.0f}")
         c3.metric("Median", f"${mc.equity_percentiles['50%']:,.0f}")
         c4.metric("95th Pctl", f"${mc.equity_percentiles['95%']:,.0f}")
-
-        # Confidence bands
         st.markdown("### 📈 Equity Confidence Bands")
         st.plotly_chart(create_mc_confidence_chart(mc), use_container_width=True)
-
-        # Final equity distribution
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("### 💰 Final Equity Distribution")
@@ -706,13 +804,9 @@ with tabs[3]:
         with c2:
             st.markdown("### 📉 Max Drawdown Distribution")
             st.plotly_chart(create_mc_histogram(mc.max_drawdowns, xaxis_title='Max DD %'), use_container_width=True)
-
-        # Sharpe distribution (bootstrap only)
         if mc.sharpe_distribution is not None:
             st.markdown("### 📊 Sharpe Ratio Distribution")
             st.plotly_chart(create_mc_histogram(mc.sharpe_distribution, xaxis_title='Sharpe'), use_container_width=True)
-
-        # DD percentiles
         c1,c2,c3 = st.columns(3)
         c1.metric("5th Pctl DD", f"{mc.dd_percentiles['5%']:.1f}%")
         c2.metric("Median DD", f"{mc.dd_percentiles['50%']:.1f}%")
@@ -720,11 +814,10 @@ with tabs[3]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CALENDAR ANALYTICS TAB — NEW
+# CALENDAR ANALYTICS TAB
 # ═══════════════════════════════════════════════════════════════════════════════
 with tabs[4]:
     st.markdown("### 📅 Calendar Analytics")
-
     if st.session_state.df is not None:
         if st.button("📅 Analyze Calendar", use_container_width=True):
             with st.spinner("Analyzing..."):
@@ -732,50 +825,17 @@ with tabs[4]:
                 st.session_state._calendar = cal
                 if st.session_state.backtest_results and st.session_state.backtest_results.trades:
                     st.session_state._trade_calendar = analyze_trade_calendar(st.session_state.backtest_results.trades)
-
         cal = st.session_state.get('_calendar')
         if cal:
             st.markdown("### 📊 Day-of-Week Returns")
             st.caption("Average daily return by day of week (historical price data)")
             st.plotly_chart(create_dow_chart(cal.day_of_week_df), use_container_width=True)
             st.dataframe(cal.day_of_week_df, use_container_width=True, hide_index=True)
-
             st.markdown("### 🗓️ Monthly Seasonality")
-            st.dataframe(cal.monthly_df, use_container_width=True, hide_index=True)
-
-            st.markdown("### 🌡️ Year × Month Heatmap")
-            st.plotly_chart(create_monthly_heatmap(cal.monthly_heatmap), use_container_width=True)
-
-            if not cal.day_of_month_df.empty:
-                st.markdown("### 📆 Day-of-Month Average Return")
-                dom = cal.day_of_month_df
-                colors = ['#ef4444' if v < 0 else '#10b981' for v in dom['Avg %']]
-                fig = go.Figure(go.Bar(x=dom['Day'], y=dom['Avg %'], marker_color=colors))
-                fig.update_layout(**_chart_layout(200), xaxis_title='Day of Month', yaxis_title='Avg %')
-                st.plotly_chart(fig, use_container_width=True)
-
-            # Trade calendar (if backtest was run)
-            tcal = st.session_state.get('_trade_calendar')
-
-            # Hourly stats (only shown for intraday data)
-            if cal.is_intraday and cal.hourly_df is not None and not cal.hourly_df.empty:
-                st.markdown("### ⏰ Hourly Returns (Intraday)")
-                st.caption("Average per-bar return by hour of day")
-                hdf = cal.hourly_df
-                colors = ['#ef4444' if v < 0 else '#10b981' for v in hdf['Avg %']]
-                fig = go.Figure(go.Bar(x=hdf['Hour'], y=hdf['Avg %'], marker_color=colors))
-                fig.update_layout(**_chart_layout(200), xaxis_title='Hour', yaxis_title='Avg %')
-                st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(hdf, use_container_width=True, hide_index=True)
-            if tcal and not tcal.trades_by_day.empty:
-                st.markdown("### 📊 Trade Performance by Entry Day")
-                st.caption("How your strategy's trades performed based on entry day")
-                st.dataframe(tcal.trades_by_day, use_container_width=True, hide_index=True)
-            if tcal and not tcal.trades_by_month.empty:
-                st.markdown("### 📊 Trade Performance by Entry Month")
-                st.dataframe(tcal.trades_by_month, use_container_width=True, hide_index=True)
-    else:
-        st.info("Load data first")
+            st.dataframe(cal.monthly_df, use_container_width=True)
+            if hasattr(cal, 'monthly_heatmap_df'):
+                st.plotly_chart(create_monthly_heatmap(cal.monthly_heatmap_df), use_container_width=True)
+    else: st.info("Load data first")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -850,4 +910,4 @@ with tabs[7]:
 
 
 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
-st.markdown('<p style="text-align:center;color:#64748b;font-size:0.7rem;">Trading Toolkit Pro v6.0</p>', unsafe_allow_html=True)
+st.markdown('<p style="text-align:center;color:#64748b;font-size:0.7rem;">Trading Toolkit Pro v7.0</p>', unsafe_allow_html=True)

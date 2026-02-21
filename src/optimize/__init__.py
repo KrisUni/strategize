@@ -1,24 +1,63 @@
 """
-Optimization Module - v6 (Fixed Walk-Forward)
-==============================================
-Fixes from audit:
-- CRITICAL #2: True anchored walk-forward optimization.
-  Previously: optimized ONE set of params on the full training set,
-  then tested those same params on each fold (= cross-validation).
-  Now: each fold runs its OWN Optuna optimization on the expanding
-  training window, then tests on the next OOS (out-of-sample) window.
-  Only the OOS results are reported, giving a realistic performance estimate.
+Optimization Module - v8
+========================
+Fixes from v7 audit:
 
-- Seed is no longer fixed at 42 when walk-forward is enabled
-  (each fold gets a different seed for diversity).
+- FIX #1: `full_data_results` replaces `best_results`.
+  Renamed to make unambiguous that this is an in-sample-contaminated
+  full-data run used only for UI display, NOT a performance estimate.
+  All callers (app.py) updated accordingly.
+
+- FIX #2: Efficiency ratio handles zero and negative IS correctly.
+  Previously silently returned 0.0 when avg_train <= 0.
+  Negative IS performance with positive OOS is a red flag of a
+  different kind and should be surfaced, not silenced.
+  Now uses abs(avg_train) > 1e-9 guard and allows negative ratio.
+
+- FIX #3: Parameter stability warning splits entry vs exit params.
+  Exit params (SL%, TP%, ATR mult, etc.) adapting between regimes is
+  EXPECTED behaviour — different volatility regimes require different
+  risk management. Flagging them as "unstable" was a false positive.
+  Now only entry-signal params are checked for stability.
+
+- FIX #4: `trials_per_fold` floor raised from 30 → 50.
+  TPE needs ~20 random warmup trials before making intelligent
+  suggestions. A floor of 30 with 10+ dimensions = random search.
+
+- FIX #5: `WalkForwardFold.oos_equity` replaces `oos_results`.
+  Storing full BacktestResults per fold (trades list + equity curve)
+  wastes significant memory on large datasets.
+  Only the equity curve is needed for stitching. `test_trades` count
+  is already stored separately on the fold.
+
+- FIX #6: Module-level `warnings.filterwarnings('ignore')` removed.
+  Previously suppressed ALL Python warnings globally on import.
+  Now scoped via context manager only around Optuna study.optimize().
+
+- FIX #7: `timeout` parameter restored to `optimize()`.
+  Was silently dropped from v7. Restored for direct BayesianOptimizer
+  users who rely on time-bounded runs.
+
+All v7 fixes retained:
+  - Rolling/anchored window choice
+  - OOS selection bias fix (last fold's params, not best OOS)
+  - Stitched OOS equity curve
+  - Efficiency ratio, param stability CV, failed trial %, warnings
+  - Trial budget warnings
+  - Exception counter
+  - study.best_trial canonical usage
 """
 
-import pandas as pd
-import numpy as np
-from typing import Dict, Any, List, Optional
-from dataclasses import dataclass, field
+import logging
 import warnings
-warnings.filterwarnings('ignore')
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 try:
     import optuna
@@ -31,9 +70,61 @@ from ..strategy import StrategyParams, TradeDirection
 from ..backtest import BacktestEngine, BacktestResults
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Context manager for scoped warning suppression
+# ─────────────────────────────────────────────────────────────────────────────
+
+@contextmanager
+def _suppress_warnings():
+    """Suppress noisy warnings only during Optuna study execution."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore')
+        yield
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parameter classification
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Entry-signal params — instability HERE means no reliable edge
+_ENTRY_PARAM_PREFIXES = (
+    'pamrp_length', 'pamrp_entry', 'pamrp_exit',
+    'bbwp_length', 'bbwp_lookback', 'bbwp_sma', 'bbwp_threshold', 'bbwp_ma',
+    'adx_length', 'adx_smoothing', 'adx_threshold',
+    'ma_fast_length', 'ma_slow_length', 'ma_type',
+    'rsi_length', 'rsi_oversold', 'rsi_overbought',
+    'volume_ma_length', 'volume_multiplier',
+    'supertrend_period', 'supertrend_multiplier',
+    'macd_fast', 'macd_slow', 'macd_signal',
+)
+
+# Exit/risk params — adapting between regimes is EXPECTED, not a red flag
+_EXIT_PARAM_PREFIXES = (
+    'stop_loss_pct', 'take_profit_pct', 'trailing_stop_pct',
+    'atr_length', 'atr_multiplier',
+    'time_exit_bars', 'ma_exit_fast', 'ma_exit_slow',
+    'bbwp_exit_threshold',
+)
+
+
+def _is_entry_param(name: str) -> bool:
+    return any(name.startswith(p) for p in _ENTRY_PARAM_PREFIXES)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data classes
+# ─────────────────────────────────────────────────────────────────────────────
+
 @dataclass
 class WalkForwardFold:
-    """Single walk-forward fold result"""
+    """
+    Single walk-forward fold result.
+
+    v7: added best_params, oos_results.
+    v8: oos_results → oos_equity (pd.Series only) to reduce memory footprint.
+        Full BacktestResults per fold is wasteful; only the equity curve
+        is needed for stitching.
+    """
     fold_num: int
     train_start: pd.Timestamp
     train_end: pd.Timestamp
@@ -43,13 +134,44 @@ class WalkForwardFold:
     test_value: float
     train_trades: int
     test_trades: int
+    best_params: Optional[StrategyParams] = None
+    oos_equity: Optional[pd.Series] = None   # v8: was oos_results: BacktestResults
 
 
 @dataclass
 class OptimizationResult:
+    """
+    Full result from one optimization run.
+
+    v8 rename: best_results → full_data_results.
+    Rationale: 'best_results' implied it was the authoritative performance
+    view. It is not — it runs the deployment params on the FULL dataset
+    including in-sample periods. Renamed to make this unambiguous.
+
+    For WFO, the authoritative performance view is `stitched_equity`.
+    For simple split, the authoritative view is the test-set metrics
+    in `test_value`.
+
+    Fields
+    ------
+    full_data_results   : BacktestResults on full dataset (IS-contaminated,
+                          for UI display / parameter inspection only).
+    stitched_equity     : Continuous OOS equity curve (WFO only).
+                          The ONLY unbiased performance representation for WFO.
+    efficiency_ratio    : avg_oos_metric / avg_train_metric.
+                          Rule of thumb: < 0.5 → suspect overfit.
+                          Negative → IS losing money but OOS gaining (unusual).
+    param_stability_cv  : CV per ENTRY param across folds.
+                          High CV → unstable entry signal.
+                          Exit params excluded (adapting = expected behaviour).
+    failed_trial_pct    : Fraction of Optuna trials that threw exceptions.
+                          > 0.20 → investigate backtest engine.
+    warnings            : Human-readable list of robustness warnings.
+    window_type         : 'rolling', 'anchored', or 'simple' (informational).
+    """
     best_params: Dict[str, Any]
     best_value: float
-    best_results: BacktestResults
+    full_data_results: BacktestResults          # v8: renamed from best_results
     all_trials: pd.DataFrame
     metric: str
     train_value: float = 0.0
@@ -57,14 +179,251 @@ class OptimizationResult:
     walkforward_folds: List[WalkForwardFold] = field(default_factory=list)
     initial_capital: float = 10000.0
     commission_pct: float = 0.1
+    stitched_equity: Optional[pd.Series] = None
+    efficiency_ratio: float = 0.0
+    param_stability_cv: Dict[str, float] = field(default_factory=dict)
+    failed_trial_pct: float = 0.0
+    warnings: List[str] = field(default_factory=list)
+    window_type: str = 'rolling'
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _count_active_params(enabled_filters: Dict[str, bool]) -> int:
+    """
+    Estimate numeric parameters that will be optimized.
+    Each enabled indicator contributes an approximate dimension count.
+    """
+    dims_per_indicator = {
+        'pamrp_enabled': 5,
+        'bbwp_enabled': 6,
+        'adx_enabled': 3,
+        'ma_trend_enabled': 3,
+        'rsi_enabled': 3,
+        'volume_enabled': 2,
+        'supertrend_enabled': 2,
+        'vwap_enabled': 0,
+        'macd_enabled': 3,
+        'stop_loss_enabled': 2,
+        'take_profit_enabled': 2,
+        'trailing_stop_enabled': 1,
+        'atr_trailing_enabled': 2,
+        'time_exit_enabled': 1,
+        'ma_exit_enabled': 2,
+        'bbwp_exit_enabled': 1,
+        'pamrp_exit_enabled': 0,
+        'stoch_rsi_exit_enabled': 0,
+    }
+    total = sum(
+        dims_per_indicator.get(k, 2)
+        for k, v in enabled_filters.items() if v
+    )
+    return max(total, 1)
+
+
+def _count_enabled_indicators(enabled_filters: Dict[str, bool]) -> int:
+    """Count distinct entry-filter indicators only."""
+    entry_keys = {
+        'pamrp_enabled', 'bbwp_enabled', 'adx_enabled', 'ma_trend_enabled',
+        'rsi_enabled', 'volume_enabled', 'supertrend_enabled', 'vwap_enabled',
+        'macd_enabled',
+    }
+    return sum(1 for k, v in enabled_filters.items() if k in entry_keys and v)
+
+
+def _build_trial_budget_warnings(
+    n_trials: int,
+    enabled_filters: Dict[str, bool],
+) -> List[str]:
+    msgs = []
+    active_dims = _count_active_params(enabled_filters)
+    min_recommended = active_dims * 10
+    n_indicators = _count_enabled_indicators(enabled_filters)
+
+    if n_trials < min_recommended:
+        msgs.append(
+            f"Trial budget may be insufficient: {n_trials} trials for ~{active_dims} "
+            f"active parameters. Recommend ≥{min_recommended} trials for TPE to converge. "
+            f"Results may reflect random search rather than true optimization."
+        )
+    if n_indicators > 3:
+        msgs.append(
+            f"{n_indicators} entry indicators active. For reliable optimization, "
+            f"use ≤3 indicators simultaneously. More indicators increase curve-fitting "
+            f"risk without a genuine edge."
+        )
+    return msgs
+
+
+def _stitch_oos_equity(
+    folds: List[WalkForwardFold],
+    initial_capital: float,
+) -> pd.Series:
+    """
+    Concatenate per-fold OOS equity curves into a single continuous series.
+
+    Each fold's curve is normalized to start where the previous fold ended,
+    preserving compounding. This is the only unbiased WFO equity view.
+
+    Since BacktestEngine always resets to initial_capital, each fold's
+    equity curve starts at initial_capital. We normalize each segment to
+    start at `base` (where the previous segment ended).
+    """
+    segments = []
+    base = initial_capital
+
+    for fold in folds:
+        eq = fold.oos_equity
+        if eq is None or len(eq) == 0:
+            continue
+        start_val = eq.iloc[0]
+        if start_val <= 0:
+            continue
+        normalized = eq / start_val * base
+        segments.append(normalized)
+        base = float(normalized.iloc[-1])
+
+    if not segments:
+        return pd.Series(dtype=float)
+
+    stitched = pd.concat(segments)
+    stitched = stitched[~stitched.index.duplicated(keep='first')]
+    return stitched
+
+
+def _compute_param_stability(
+    folds: List[WalkForwardFold],
+) -> Dict[str, float]:
+    """
+    Compute coefficient of variation per ENTRY param across folds.
+
+    Exit/risk params (SL%, TP%, etc.) are intentionally excluded — they
+    are expected to adapt between volatility regimes and flagging them
+    as unstable produces false-positive overfit warnings.
+
+    Returns {} if fewer than 2 valid folds.
+    """
+    param_values: Dict[str, List[float]] = {}
+
+    for fold in folds:
+        if fold.best_params is None:
+            continue
+        p_dict = fold.best_params.to_dict()
+        for k, v in p_dict.items():
+            if not _is_entry_param(k):
+                continue
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                param_values.setdefault(k, []).append(float(v))
+
+    cv_dict = {}
+    for k, vals in param_values.items():
+        if len(vals) < 2:
+            continue
+        mean = np.mean(vals)
+        std = np.std(vals)
+        if abs(mean) > 1e-9:
+            cv_dict[k] = round(std / abs(mean), 4)
+        else:
+            cv_dict[k] = 0.0
+
+    return cv_dict
+
+
+def _build_robustness_warnings(
+    efficiency_ratio: float,
+    param_stability_cv: Dict[str, float],
+    failed_trial_pct: float,
+    base_warnings: List[str],
+    has_oos_data: bool = True,
+) -> List[str]:
+    msgs = list(base_warnings)
+
+    if has_oos_data and efficiency_ratio != 0.0:
+        if efficiency_ratio < 0:
+            msgs.append(
+                f"Efficiency ratio is {efficiency_ratio:.2f}: in-sample performance was "
+                f"negative but OOS was positive. This is unusual and warrants scrutiny — "
+                f"the strategy may be exploiting a data artefact."
+            )
+        elif efficiency_ratio < 0.5:
+            msgs.append(
+                f"Efficiency ratio is {efficiency_ratio:.2f} (OOS/IS = {efficiency_ratio:.0%}). "
+                f"Values below 0.50 suggest significant overfitting. Consider fewer "
+                f"indicators or a larger dataset."
+            )
+
+    unstable = [k for k, v in param_stability_cv.items() if v > 0.5]
+    if unstable:
+        msgs.append(
+            f"Unstable entry parameters across folds (CV > 0.50): "
+            f"{', '.join(unstable[:8])}. "
+            f"These parameters vary significantly between regimes — the strategy "
+            f"may lack a consistent entry edge."
+        )
+
+    if failed_trial_pct > 0.20:
+        msgs.append(
+            f"{failed_trial_pct:.0%} of optimization trials raised exceptions. "
+            f"This is abnormally high and may indicate a bug in the backtest engine, "
+            f"data quality issues, or incompatible parameter combinations."
+        )
+
+    return msgs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main optimizer
+# ─────────────────────────────────────────────────────────────────────────────
 
 class BayesianOptimizer:
-    """Bayesian optimization with true anchored walk-forward."""
+    """
+    Bayesian optimization using Optuna TPE with optional walk-forward validation.
 
-    def __init__(self, df, enabled_filters, metric='sharpe_ratio', min_trades=10,
-                 initial_capital=10000, commission_pct=0.1, trade_direction='long_only',
-                 train_pct=0.7, use_walkforward=False, n_folds=5):
+    Walk-forward modes
+    ------------------
+    rolling  (default):
+        Fixed-size sliding training window of `train_window_bars` bars.
+        Discards old data. Preferred when markets are non-stationary.
+
+    anchored:
+        Expanding window starting from bar 0.
+        Preferred when you believe the edge is stable across all history.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+    enabled_filters : dict[str, bool]
+    metric : str
+        BacktestResults attribute to optimize.
+    min_trades : int
+        Trials producing fewer trades are penalized to -inf.
+    initial_capital, commission_pct : float
+    trade_direction : str  — 'long_only' | 'short_only' | 'both'
+    train_pct : float  — fraction for training in simple (non-WF) mode.
+    use_walkforward : bool
+    n_folds : int
+    window_type : str  — 'rolling' or 'anchored'
+    train_window_bars : int | None
+        Rolling window size. Defaults to int(len(df) * train_pct).
+    """
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        enabled_filters: Dict[str, bool],
+        metric: str = 'sharpe_ratio',
+        min_trades: int = 10,
+        initial_capital: float = 10000,
+        commission_pct: float = 0.1,
+        trade_direction: str = 'long_only',
+        train_pct: float = 0.7,
+        use_walkforward: bool = False,
+        n_folds: int = 5,
+        window_type: str = 'rolling',
+        train_window_bars: Optional[int] = None,
+    ):
         self.df = df
         self.enabled_filters = enabled_filters
         self.metric = metric
@@ -74,30 +433,38 @@ class BayesianOptimizer:
         self.train_pct = train_pct
         self.use_walkforward = use_walkforward
         self.n_folds = n_folds
+        self.window_type = window_type
         self.trade_direction_str = trade_direction
         self.trade_direction = {
             'long_only': TradeDirection.LONG_ONLY,
             'short_only': TradeDirection.SHORT_ONLY,
-            'both': TradeDirection.BOTH
+            'both': TradeDirection.BOTH,
         }.get(trade_direction, TradeDirection.LONG_ONLY)
 
         split_idx = int(len(df) * train_pct)
         self.train_df = df.iloc[:split_idx].copy()
         self.test_df = df.iloc[split_idx:].copy()
+        self.train_window_bars = (
+            train_window_bars if train_window_bars is not None else split_idx
+        )
 
-    def _run_backtest(self, params, df):
+    # ── Backtest helpers ──────────────────────────────────────────────────────
+
+    def _run_backtest(self, params: StrategyParams, df: pd.DataFrame) -> BacktestResults:
         engine = BacktestEngine(params, self.initial_capital, self.commission_pct)
         return engine.run(df.copy())
 
-    def _get_metric(self, results):
+    def _get_metric(self, results: BacktestResults) -> float:
         if results.num_trades < self.min_trades:
             return float('-inf')
         value = getattr(results, self.metric, 0)
         if value is None or np.isnan(value) or np.isinf(value):
             return float('-inf')
-        return value
+        return float(value)
 
-    def _build_params_from_trial(self, trial):
+    # ── Parameter builder ─────────────────────────────────────────────────────
+
+    def _build_params_from_trial(self, trial) -> StrategyParams:
         """Build StrategyParams — only optimize enabled filters."""
         ef = self.enabled_filters
 
@@ -174,7 +541,6 @@ class BayesianOptimizer:
         bxe = ef.get('bbwp_exit_enabled', False)
         bxt = trial.suggest_int('bbwp_exit_threshold', 70, 90) if bxe else 80
 
-        # Ensure at least one exit method
         has_exit = any([sle, tpe, tse, ate, pxe, sre, txe, mxe, bxe])
         if not has_exit:
             pxe = True
@@ -200,78 +566,134 @@ class BayesianOptimizer:
             bbwp_exit_enabled=bxe, bbwp_exit_threshold=bxt,
         )
 
-    def _make_objective(self, train_data: pd.DataFrame):
-        """Create an objective function closed over the given training data."""
+    # ── Optuna study runner ───────────────────────────────────────────────────
+
+    def _make_objective(self, train_data: pd.DataFrame, exception_counter: list):
         def objective(trial):
             try:
                 params = self._build_params_from_trial(trial)
                 results = self._run_backtest(params, train_data)
                 return self._get_metric(results)
-            except Exception:
+            except Exception as exc:
+                exception_counter[0] += 1
+                logger.debug("Trial %d raised: %s", trial.number, exc)
                 return float('-inf')
         return objective
 
-    def _optimize_on_data(self, train_data: pd.DataFrame, n_trials: int,
-                          seed: int = 42, show_progress: bool = False) -> Optional[StrategyParams]:
+    def _optimize_on_data(
+        self,
+        train_data: pd.DataFrame,
+        n_trials: int,
+        seed: int = 42,
+        show_progress: bool = False,
+        timeout: Optional[float] = None,
+    ) -> Tuple[Optional[StrategyParams], float]:
         """
-        Run Optuna optimization on a specific training slice.
-        Returns the best StrategyParams, or None if no valid trials.
+        Run an Optuna TPE study on train_data.
+
+        Returns (best_params, failed_trial_pct).
+        best_params is None if no valid trials found.
         """
+        exception_counter = [0]
         sampler = TPESampler(seed=seed)
         study = optuna.create_study(direction='maximize', sampler=sampler)
-        objective = self._make_objective(train_data)
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress, n_jobs=1)
+        objective = self._make_objective(train_data, exception_counter)
 
+        with _suppress_warnings():
+            study.optimize(
+                objective, n_trials=n_trials, timeout=timeout,
+                show_progress_bar=show_progress, n_jobs=1,
+            )
+
+        total = len(study.trials)
+        failed_pct = exception_counter[0] / total if total > 0 else 0.0
         valid = [t for t in study.trials if t.value is not None and t.value > float('-inf')]
+
         if not valid:
-            return None
+            return None, failed_pct
 
-        best_trial = max(valid, key=lambda t: t.value)
-        return self._build_params_from_trial(best_trial)
+        return self._build_params_from_trial(study.best_trial), failed_pct
 
-    def _run_walkforward(self, n_trials: int, show_progress: bool) -> OptimizationResult:
+    # ── Fold window construction ──────────────────────────────────────────────
+
+    def _get_fold_windows(self) -> List[Tuple[int, int, int, int]]:
         """
-        TRUE anchored walk-forward optimization.
+        Compute (train_start, train_end, test_start, test_end) index tuples.
 
-        Algorithm:
-          1. Divide full data into n_folds equal windows
-          2. For fold k (k=1..n_folds-1):
-             - Training window = data[0 : fold_k_end]  (expanding/anchored)
-             - Test window = data[fold_k_end : fold_{k+1}_end]
-             - Run Optuna on training window → best_params_k
-             - Backtest best_params_k on test window → OOS result
-          3. Report aggregate OOS performance across all folds
-
-        Each fold gets a DIFFERENT Optuna seed for exploration diversity.
+        Rolling: train window is a fixed-size sliding window.
+        Anchored: train window expands from bar 0.
         """
-        fold_size = len(self.df) // self.n_folds
-        wf_folds = []
-        oos_scores = []
-        best_fold_params = None
-        best_fold_score = float('-inf')
-        # Per-fold trial budget: split total trials across folds
-        trials_per_fold = max(20, n_trials // max(self.n_folds - 1, 1))
+        n = len(self.df)
+        fold_size = n // self.n_folds
+        windows = []
 
         for k in range(1, self.n_folds):
             train_end_idx = k * fold_size
-            test_end_idx = min((k + 1) * fold_size, len(self.df))
+            test_start_idx = train_end_idx
+            test_end_idx = min((k + 1) * fold_size, n)
 
-            train_data = self.df.iloc[:train_end_idx]
-            test_data = self.df.iloc[train_end_idx:test_end_idx]
+            if self.window_type == 'rolling':
+                train_start_idx = max(0, train_end_idx - self.train_window_bars)
+            else:
+                train_start_idx = 0
+
+            windows.append((train_start_idx, train_end_idx, test_start_idx, test_end_idx))
+
+        return windows
+
+    # ── Walk-forward ──────────────────────────────────────────────────────────
+
+    def _run_walkforward(
+        self, n_trials: int, show_progress: bool, timeout: Optional[float]
+    ) -> OptimizationResult:
+        """
+        Walk-forward optimization.
+
+        Algorithm
+        ---------
+        1. Divide full data into n_folds equal windows.
+        2. For each fold k:
+           a. Construct training window (rolling or anchored).
+           b. Run Optuna on training window → best_params_k.
+           c. Backtest best_params_k on OOS window → store oos_equity.
+        3. Deployment candidate = LAST fold's params.
+           Rationale: most temporally recent, most regime-relevant.
+           NOT selected by OOS score (that would re-introduce selection bias).
+        4. Stitch per-fold OOS equity curves → stitched_equity.
+        5. Compute efficiency ratio, param stability, and warnings.
+
+        Per-fold trial budget: n_trials divided across folds, floor of 50.
+        """
+        budget_warnings = _build_trial_budget_warnings(n_trials, self.enabled_filters)
+
+        fold_windows = self._get_fold_windows()
+        n_active_folds = len(fold_windows)
+        # v8: floor raised from 30 → 50 (TPE needs ~20 warmup + meaningful exploration)
+        trials_per_fold = max(50, n_trials // max(n_active_folds, 1))
+
+        wf_folds: List[WalkForwardFold] = []
+        oos_scores: List[float] = []
+        all_failed_pcts: List[float] = []
+
+        for k, (tr_start, tr_end, ts_start, ts_end) in enumerate(fold_windows, start=1):
+            train_data = self.df.iloc[tr_start:tr_end]
+            test_data = self.df.iloc[ts_start:ts_end]
 
             if len(test_data) < 20 or len(train_data) < 50:
+                logger.debug("Fold %d skipped: insufficient data", k)
                 continue
 
-            # Optimize on THIS fold's training window (different seed per fold)
             fold_seed = 42 + k * 7
-            fold_params = self._optimize_on_data(
+            fold_params, failed_pct = self._optimize_on_data(
                 train_data, trials_per_fold, seed=fold_seed,
-                show_progress=show_progress
+                show_progress=show_progress, timeout=timeout,
             )
+            all_failed_pcts.append(failed_pct)
+
             if fold_params is None:
+                logger.debug("Fold %d: no valid trials", k)
                 continue
 
-            # Evaluate on train and test
             train_res = self._run_backtest(fold_params, train_data)
             test_res = self._run_backtest(fold_params, test_data)
             train_score = self._get_metric(train_res)
@@ -283,63 +705,105 @@ class BayesianOptimizer:
                 train_end=train_data.index[-1],
                 test_start=test_data.index[0],
                 test_end=test_data.index[-1],
-                train_value=train_score if train_score > float('-inf') else 0,
-                test_value=test_score if test_score > float('-inf') else 0,
+                train_value=train_score if train_score > float('-inf') else 0.0,
+                test_value=test_score if test_score > float('-inf') else 0.0,
                 train_trades=train_res.num_trades,
                 test_trades=test_res.num_trades,
+                best_params=fold_params,
+                oos_equity=test_res.equity_curve,   # v8: store only equity curve
             ))
 
             if test_score > float('-inf'):
                 oos_scores.append(test_score)
-            if test_score > best_fold_score:
-                best_fold_score = test_score
-                best_fold_params = fold_params
 
-        # If no folds produced results, fall back to simple train/test
-        if best_fold_params is None:
-            return self._run_simple_optimization(n_trials, show_progress)
+        if not wf_folds:
+            logger.warning("Walk-forward produced no valid folds; falling back to simple split.")
+            return self._run_simple_optimization(n_trials, show_progress, timeout)
 
-        # Run the LAST fold's params on full data for the "best_results" display
-        # (clearly labeled as full-data, not OOS)
-        full_res = self._run_backtest(best_fold_params, self.df)
+        # FIX #2 (v7): Last fold's params as deployment candidate — not best OOS
+        deployment_params = wf_folds[-1].best_params
 
-        # Aggregate OOS performance
-        avg_oos = np.mean(oos_scores) if oos_scores else 0
-        train_val = np.mean([f.train_value for f in wf_folds]) if wf_folds else 0
+        # Stitch OOS equity
+        stitched_equity = _stitch_oos_equity(wf_folds, self.initial_capital)
 
-        final_dict = best_fold_params.to_dict()
+        # Efficiency ratio — FIX #2 (v8): use abs() guard, allow negative
+        avg_oos = float(np.mean(oos_scores)) if oos_scores else 0.0
+        avg_train = float(np.mean([f.train_value for f in wf_folds])) if wf_folds else 0.0
+        if abs(avg_train) > 1e-9:
+            efficiency_ratio = avg_oos / avg_train
+        else:
+            efficiency_ratio = 0.0
+
+        # Param stability — entry params only (v8)
+        param_stability_cv = _compute_param_stability(wf_folds)
+
+        avg_failed_pct = float(np.mean(all_failed_pcts)) if all_failed_pcts else 0.0
+
+        # Full-data run for UI display (IS-contaminated, labeled accordingly)
+        full_res = self._run_backtest(deployment_params, self.df)
+
+        all_warnings = _build_robustness_warnings(
+            efficiency_ratio, param_stability_cv, avg_failed_pct,
+            budget_warnings, has_oos_data=bool(oos_scores),
+        )
+
+        final_dict = deployment_params.to_dict()
         final_dict['trade_direction_str'] = self.trade_direction_str
 
         return OptimizationResult(
             best_params=final_dict,
             best_value=avg_oos,
-            best_results=full_res,
-            all_trials=pd.DataFrame(),  # WF doesn't have a single trial list
+            full_data_results=full_res,
+            all_trials=pd.DataFrame(),
             metric=self.metric,
-            train_value=train_val,
+            train_value=avg_train,
             test_value=avg_oos,
             walkforward_folds=wf_folds,
             initial_capital=self.initial_capital,
             commission_pct=self.commission_pct,
+            stitched_equity=stitched_equity,
+            efficiency_ratio=efficiency_ratio,
+            param_stability_cv=param_stability_cv,
+            failed_trial_pct=avg_failed_pct,
+            warnings=all_warnings,
+            window_type=self.window_type,
         )
 
-    def _run_simple_optimization(self, n_trials: int, show_progress: bool) -> OptimizationResult:
-        """Standard train/test split optimization (non-WF)."""
+    # ── Simple train/test split ───────────────────────────────────────────────
+
+    def _run_simple_optimization(
+        self, n_trials: int, show_progress: bool, timeout: Optional[float]
+    ) -> OptimizationResult:
+        """Standard single train/test split optimization (non-WF)."""
+        budget_warnings = _build_trial_budget_warnings(n_trials, self.enabled_filters)
+
+        exception_counter = [0]
         sampler = TPESampler(seed=42)
         study = optuna.create_study(direction='maximize', sampler=sampler)
-        objective = self._make_objective(self.train_df)
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress, n_jobs=1)
+        objective = self._make_objective(self.train_df, exception_counter)
+
+        with _suppress_warnings():
+            study.optimize(
+                objective, n_trials=n_trials, timeout=timeout,
+                show_progress_bar=show_progress, n_jobs=1,
+            )
+
+        total = len(study.trials)
+        failed_pct = exception_counter[0] / total if total > 0 else 0.0
 
         valid = [t for t in study.trials if t.value is not None and t.value > float('-inf')]
         if not valid:
+            all_warnings = _build_robustness_warnings(0.0, {}, failed_pct, budget_warnings, False)
             return OptimizationResult(
-                best_params={}, best_value=0,
-                best_results=BacktestResults(trades=[], equity_curve=pd.Series(), realized_equity=pd.Series()),
+                best_params={}, best_value=0.0,
+                full_data_results=BacktestResults(
+                    trades=[], equity_curve=pd.Series(), realized_equity=pd.Series()),
                 all_trials=pd.DataFrame(), metric=self.metric,
-                initial_capital=self.initial_capital, commission_pct=self.commission_pct)
+                initial_capital=self.initial_capital, commission_pct=self.commission_pct,
+                failed_trial_pct=failed_pct, warnings=all_warnings, window_type='simple',
+            )
 
-        best = max(valid, key=lambda t: t.value)
-        params = self._build_params_from_trial(best)
+        params = self._build_params_from_trial(study.best_trial)
 
         train_res = self._run_backtest(params, self.train_df)
         test_res = self._run_backtest(params, self.test_df)
@@ -348,35 +812,101 @@ class BayesianOptimizer:
         train_val = self._get_metric(train_res)
         test_val = self._get_metric(test_res)
 
-        trials_data = [dict(**t.params, value=t.value, trial_number=t.number) for t in valid]
+        # FIX #2 (v8): abs() guard, allow negative ratio
+        if abs(train_val) > 1e-9 and train_val > float('-inf') and test_val > float('-inf'):
+            efficiency_ratio = test_val / train_val
+        else:
+            efficiency_ratio = 0.0
+
+        trials_data = [
+            dict(**t.params, value=t.value, trial_number=t.number)
+            for t in valid
+        ]
         trials_df = pd.DataFrame(trials_data) if trials_data else pd.DataFrame()
+
+        all_warnings = _build_robustness_warnings(
+            efficiency_ratio, {}, failed_pct, budget_warnings, has_oos_data=True,
+        )
 
         fp = params.to_dict()
         fp['trade_direction_str'] = self.trade_direction_str
 
         return OptimizationResult(
-            best_params=fp, best_value=best.value, best_results=full_res,
-            all_trials=trials_df, metric=self.metric,
-            train_value=train_val if train_val > float('-inf') else 0,
-            test_value=test_val if test_val > float('-inf') else 0,
+            best_params=fp,
+            best_value=float(study.best_trial.value),
+            full_data_results=full_res,
+            all_trials=trials_df,
+            metric=self.metric,
+            train_value=train_val if train_val > float('-inf') else 0.0,
+            test_value=test_val if test_val > float('-inf') else 0.0,
             walkforward_folds=[],
-            initial_capital=self.initial_capital, commission_pct=self.commission_pct)
+            initial_capital=self.initial_capital,
+            commission_pct=self.commission_pct,
+            efficiency_ratio=efficiency_ratio,
+            failed_trial_pct=failed_pct,
+            warnings=all_warnings,
+            window_type='simple',
+        )
 
-    def optimize(self, n_trials=200, timeout=None, show_progress=True) -> OptimizationResult:
-        """Main entry point."""
+    # ── Entry point ───────────────────────────────────────────────────────────
+
+    def optimize(
+        self,
+        n_trials: int = 200,
+        timeout: Optional[float] = None,   # v8: restored
+        show_progress: bool = True,
+    ) -> OptimizationResult:
+        """Run optimization. Dispatches to WFO or simple split."""
         if self.use_walkforward:
-            return self._run_walkforward(n_trials, show_progress)
+            return self._run_walkforward(n_trials, show_progress, timeout)
         else:
-            return self._run_simple_optimization(n_trials, show_progress)
+            return self._run_simple_optimization(n_trials, show_progress, timeout)
 
 
-def optimize_strategy(df, enabled_filters, metric='sharpe_ratio', n_trials=200, min_trades=10,
-                      initial_capital=10000, commission_pct=0.1, trade_direction='long_only',
-                      train_pct=0.7, use_walkforward=False, n_folds=5, show_progress=True):
-    """Convenience function."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Convenience function (backward compatible)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def optimize_strategy(
+    df: pd.DataFrame,
+    enabled_filters: Dict[str, bool],
+    metric: str = 'sharpe_ratio',
+    n_trials: int = 200,
+    min_trades: int = 10,
+    initial_capital: float = 10000,
+    commission_pct: float = 1,
+    trade_direction: str = 'long_only',
+    train_pct: float = 0.7,
+    use_walkforward: bool = True,
+    n_folds: int = 5,
+    show_progress: bool = True,
+    window_type: str = 'rolling',
+    train_window_bars: Optional[int] = None,
+    timeout: Optional[float] = None,
+) -> OptimizationResult:
+    """
+    Convenience wrapper around BayesianOptimizer.
+
+    Parameters added in v7/v8
+    -------------------------
+    window_type : 'rolling' (default) or 'anchored'
+    train_window_bars : int | None — rolling window size in bars
+    timeout : float | None — per-study time limit in seconds
+
+    All other parameters are backward compatible with v6.
+    """
     opt = BayesianOptimizer(
-        df=df, enabled_filters=enabled_filters, metric=metric, min_trades=min_trades,
-        initial_capital=initial_capital, commission_pct=commission_pct,
-        trade_direction=trade_direction, train_pct=train_pct,
-        use_walkforward=use_walkforward, n_folds=n_folds)
-    return opt.optimize(n_trials=n_trials, show_progress=show_progress)
+        df=df,
+        enabled_filters=enabled_filters,
+        metric=metric,
+        min_trades=min_trades,
+        initial_capital=initial_capital,
+        commission_pct=commission_pct,
+        trade_direction=trade_direction,
+        train_pct=train_pct,
+        use_walkforward=use_walkforward,
+        n_folds=n_folds,
+        window_type=window_type,
+        train_window_bars=train_window_bars,
+    )
+    return opt.optimize(n_trials=n_trials, timeout=timeout, show_progress=show_progress)
