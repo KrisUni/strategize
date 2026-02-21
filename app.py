@@ -32,7 +32,7 @@ from src.analytics import analyze_calendar, analyze_trade_calendar
 # ═══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="Strategy Lab ",
+    page_title="Strategy Lab",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -374,24 +374,180 @@ def create_mc_histogram(values, title='', xaxis_title=''):
     fig.update_layout(**_chart_layout(220), xaxis_title=xaxis_title)
     return fig
 
-def create_dow_chart(dow_df):
-    if dow_df.empty: return go.Figure()
+def create_dow_chart(dow_df: pd.DataFrame):
+    """Bar chart: avg return by day of week, coloured by sign, with win rate overlay."""
+    if dow_df.empty:
+        return go.Figure()
+
     colors = ['#ef4444' if v < 0 else '#10b981' for v in dow_df['Avg %']]
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=dow_df['Day'], y=dow_df['Avg %'], marker_color=colors, text=[f"{v:+.4f}%" for v in dow_df['Avg %']], textposition='outside'))
-    fig.update_layout(**_chart_layout(250), yaxis_title='Avg Return %')
+    win_rates = [float(w.replace('%', '')) for w in dow_df['Win Rate']]
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+        row_heights=[0.65, 0.35],
+        subplot_titles=['Average Daily Return %', 'Win Rate %'],
+    )
+
+    fig.add_trace(go.Bar(
+        x=dow_df['Day'], y=dow_df['Avg %'],
+        marker_color=colors,
+        text=[f"{v:+.4f}%" for v in dow_df['Avg %']],
+        textposition='outside',
+        name='Avg Return',
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=dow_df['Day'], y=win_rates,
+        marker_color='#3b82f6', opacity=0.7,
+        text=[f"{w:.1f}%" for w in win_rates],
+        textposition='outside',
+        name='Win Rate',
+    ), row=2, col=1)
+
+    fig.add_hline(y=50, line_dash='dot', line_color='#64748b', row=2, col=1)
+
+    fig.update_layout(
+        **_chart_layout(380, showlegend=False),
+        bargap=0.3,
+    )
     fig.update_xaxes(type='category', fixedrange=True)
     fig.update_yaxes(fixedrange=True)
     return fig
 
-def create_monthly_heatmap(heatmap_df):
-    if heatmap_df.empty: return go.Figure()
+
+def create_monthly_bar_chart(monthly_df: pd.DataFrame):
+    """Bar chart: avg return by calendar month with win rate overlay."""
+    if monthly_df.empty:
+        return go.Figure()
+
+    colors = ['#ef4444' if v < 0 else '#10b981' for v in monthly_df['Avg %']]
+    win_rates = [float(w.replace('%', '')) for w in monthly_df['Win Rate']]
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+        row_heights=[0.65, 0.35],
+        subplot_titles=['Average Monthly Return %', 'Win Rate %'],
+    )
+    fig.add_trace(go.Bar(
+        x=monthly_df['Month'], y=monthly_df['Avg %'],
+        marker_color=colors,
+        text=[f"{v:+.2f}%" for v in monthly_df['Avg %']],
+        textposition='outside', name='Avg Return',
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=monthly_df['Month'], y=win_rates,
+        marker_color='#3b82f6', opacity=0.7,
+        text=[f"{w:.1f}%" for w in win_rates],
+        textposition='outside', name='Win Rate',
+    ), row=2, col=1)
+    fig.add_hline(y=50, line_dash='dot', line_color='#64748b', row=2, col=1)
+    fig.update_layout(**_chart_layout(380, showlegend=False), bargap=0.3)
+    fig.update_xaxes(type='category', fixedrange=True)
+    fig.update_yaxes(fixedrange=True)
+    return fig
+
+
+def create_monthly_heatmap(heatmap_df: pd.DataFrame):
+    """Year × Month heatmap with value annotations."""
+    if heatmap_df.empty:
+        return go.Figure()
+
+    z = heatmap_df.values
+    # Replace NaN with None so Plotly renders them as blank cells
+    z_display = np.where(np.isnan(z.astype(float)), None, z)
+
+    text = np.where(
+        np.isnan(z.astype(float)),
+        '',
+        [[f"{v:.1f}%" if v is not None else '' for v in row] for row in z]
+    )
+
     fig = go.Figure(data=go.Heatmap(
-        z=heatmap_df.values, x=heatmap_df.columns.tolist(),
-        y=[str(y) for y in heatmap_df.index], colorscale='RdYlGn', zmid=0,
-        text=np.round(heatmap_df.values, 2), texttemplate='%{text:.1f}%', showscale=True
+        z=z_display,
+        x=heatmap_df.columns.tolist(),
+        y=[str(y) for y in heatmap_df.index],
+        colorscale='RdYlGn',
+        zmid=0,
+        text=text,
+        texttemplate='%{text}',
+        showscale=True,
+        colorbar=dict(title='Return %', thickness=12),
     ))
-    fig.update_layout(**_chart_layout(max(200, len(heatmap_df) * 35)))
+    height = max(250, len(heatmap_df) * 38 + 60)
+    fig.update_layout(**_chart_layout(height))
+    return fig
+
+
+def create_dom_chart(dom_df: pd.DataFrame):
+    """Day-of-month bar chart with avg return and win rate line overlay."""
+    if dom_df.empty:
+        return go.Figure()
+
+    colors = ['#ef4444' if v < 0 else '#10b981' for v in dom_df['Avg %']]
+    win_rates = [float(w.replace('%', '')) for w in dom_df['Win Rate']]
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Bar(
+        x=dom_df['Day of Month'], y=dom_df['Avg %'],
+        marker_color=colors, name='Avg Return %', opacity=0.85,
+    ), secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=dom_df['Day of Month'], y=win_rates,
+        mode='lines+markers',
+        line=dict(color='#f59e0b', width=2),
+        marker=dict(size=5),
+        name='Win Rate %',
+    ), secondary_y=True)
+    fig.add_hline(y=0, line_dash='dot', line_color='#64748b', secondary_y=False)
+    fig.update_layout(**_chart_layout(280, showlegend=True, legend=dict(orientation='h', y=1.1)))
+    fig.update_xaxes(title_text='Day of Month', dtick=1, fixedrange=True)
+    fig.update_yaxes(title_text='Avg Return %', fixedrange=True, secondary_y=False)
+    fig.update_yaxes(title_text='Win Rate %', fixedrange=True, secondary_y=True)
+    return fig
+
+
+def create_hourly_chart(hourly_df: pd.DataFrame):
+    """Hourly avg return bar chart (intraday data only)."""
+    if hourly_df is None or hourly_df.empty:
+        return go.Figure()
+
+    colors = ['#ef4444' if v < 0 else '#10b981' for v in hourly_df['Avg %']]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=hourly_df['Hour'], y=hourly_df['Avg %'],
+        marker_color=colors,
+        text=[f"{v:+.4f}%" for v in hourly_df['Avg %']],
+        textposition='outside',
+    ))
+    fig.add_hline(y=0, line_dash='dot', line_color='#64748b')
+    fig.update_layout(**_chart_layout(260), bargap=0.2)
+    fig.update_xaxes(type='category', fixedrange=True)
+    fig.update_yaxes(fixedrange=True)
+    return fig
+
+
+def create_return_distribution_chart(dist):
+    """Histogram of daily returns with mean/±1σ lines."""
+    if not dist.bins:
+        return go.Figure()
+
+    colors = ['#ef4444' if b < 0 else '#10b981' for b in dist.bins]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=dist.bins, y=dist.counts,
+        marker_color=colors, opacity=0.75, name='Frequency',
+    ))
+    for val, label, color in [
+        (dist.mean, f'Mean {dist.mean:+.3f}%', '#f59e0b'),
+        (dist.mean - dist.std, f'−1σ {dist.mean - dist.std:.3f}%', '#94a3b8'),
+        (dist.mean + dist.std, f'+1σ {dist.mean + dist.std:.3f}%', '#94a3b8'),
+    ]:
+        fig.add_vline(x=val, line_dash='dash', line_color=color,
+                      annotation_text=label, annotation_position='top')
+    fig.update_layout(
+        **_chart_layout(280, showlegend=False),
+        xaxis_title='Daily Return %', yaxis_title='Frequency',
+    )
     return fig
 
 
@@ -401,7 +557,7 @@ def create_monthly_heatmap(heatmap_df):
 
 p = st.session_state.params
 with st.sidebar:
-    st.markdown("# 📊 Strategy Lab ")
+    st.markdown("# 📊 Strategy Lab")
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     st.markdown("### 📈 Data")
     data_src = st.radio("Source", ["Yahoo Finance", "Sample", "CSV"], horizontal=True, label_visibility="collapsed")
@@ -409,9 +565,9 @@ with st.sidebar:
     # yfinance API hard limits per interval (calendar days)
     _INTERVAL_MAX_DAYS = {
         '1m': 7, '2m': 60, '5m': 60, '15m': 60, '30m': 60,
-        '90m': 60, '1h': 730,
+        '60m': 730, '90m': 60, '1h': 730,
     }
-    INTERVALS = ["1m","2m","5m","15m","30m","90m","1h","1d","5d","1wk","1mo","3mo"]
+    INTERVALS = ["1m","2m","5m","15m","30m","60m","90m","1h","1d","5d","1wk","1mo","3mo"]
 
     symbol, interval, days = "SPY", "1d", 730
     uploaded_file = None
@@ -613,7 +769,7 @@ st.session_state.params = p
 # MAIN CONTENT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.markdown("# 📊 Strategy Lab ")
+st.markdown("# 📊 Strategy Lab")
 tabs = st.tabs(["🔬 Backtest", "🎯 Optimize", "⚖️ Compare", "🎲 Monte Carlo", "📅 Calendar", "🔥 Heatmap", "🌐 Multi-Asset", "📋 Trades"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1026,26 +1182,121 @@ with tabs[3]:
 # ═══════════════════════════════════════════════════════════════════════════════
 # CALENDAR ANALYTICS TAB
 # ═══════════════════════════════════════════════════════════════════════════════
+# CALENDAR TAB
+# ═══════════════════════════════════════════════════════════════════════════════
 with tabs[4]:
     st.markdown("### 📅 Calendar Analytics")
-    if st.session_state.df is not None:
+    if st.session_state.df is None:
+        st.info("Load data first.")
+    else:
         if st.button("📅 Analyze Calendar", use_container_width=True):
             with st.spinner("Analyzing..."):
                 cal = analyze_calendar(st.session_state.df)
                 st.session_state._calendar = cal
                 if st.session_state.backtest_results and st.session_state.backtest_results.trades:
-                    st.session_state._trade_calendar = analyze_trade_calendar(st.session_state.backtest_results.trades)
+                    st.session_state._trade_calendar = analyze_trade_calendar(
+                        st.session_state.backtest_results.trades
+                    )
+
         cal = st.session_state.get('_calendar')
         if cal:
-            st.markdown("### 📊 Day-of-Week Returns")
-            st.caption("Average daily return by day of week (historical price data)")
-            st.plotly_chart(create_dow_chart(cal.day_of_week_df), use_container_width=True)
-            st.dataframe(cal.day_of_week_df, use_container_width=True, hide_index=True)
-            st.markdown("### 🗓️ Monthly Seasonality")
-            st.dataframe(cal.monthly_df, use_container_width=True)
-            if hasattr(cal, 'monthly_heatmap_df'):
-                st.plotly_chart(create_monthly_heatmap(cal.monthly_heatmap_df), use_container_width=True)
-    else: st.info("Load data first")
+            # ── Summary headline row ───────────────────────────────────────────
+            ss = cal.summary_stats
+            if ss:
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Observations", f"{ss.get('total_observations', 0):,}")
+                c2.metric("Daily Win Rate", f"{ss.get('overall_win_rate', 0):.1f}%")
+                c3.metric("Best Day", ss.get('best_day', '—'),
+                          delta=f"avg {ss.get('best_day_avg', 0):+.4f}%")
+                c4.metric("Best Month", ss.get('best_month', '—'),
+                          delta=f"avg {ss.get('best_month_avg', 0):+.2f}%")
+                c5.metric("Ann. Return (daily avg)", f"{ss.get('annualized_return', 0):+.2f}%")
+                st.markdown("---")
+
+            # ── Consecutive stats row ──────────────────────────────────────────
+            cons = cal.consecutive
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Max Win Streak",  f"{cons.max_win_streak}d")
+            c2.metric("Max Loss Streak", f"{cons.max_loss_streak}d")
+            c3.metric("Avg Win Streak",  f"{cons.avg_win_streak:.1f}d")
+            c4.metric("Avg Loss Streak", f"{cons.avg_loss_streak:.1f}d")
+            cur = cons.current_streak
+            c5.metric("Current Streak",
+                      f"{'🟢' if cur >= 0 else '🔴'} {abs(cur)}d",
+                      delta="winning" if cur >= 0 else "losing",
+                      delta_color="normal" if cur >= 0 else "inverse")
+            st.markdown("---")
+
+            # ── Day of Week ────────────────────────────────────────────────────
+            st.markdown("#### 📆 Day-of-Week Returns")
+            st.caption("Daily returns resampled to business days. Intraday data aggregated correctly.")
+            st.plotly_chart(create_dow_chart(cal.day_of_week_df), use_container_width=True,
+                            config={'displayModeBar': False})
+            with st.expander("📋 Day-of-Week Table", expanded=False):
+                st.dataframe(cal.day_of_week_df, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+
+            # ── Monthly Seasonality ────────────────────────────────────────────
+            st.markdown("#### 🗓️ Monthly Seasonality")
+            st.plotly_chart(create_monthly_bar_chart(cal.monthly_df), use_container_width=True,
+                            config={'displayModeBar': False})
+            if not cal.monthly_heatmap.empty:
+                st.markdown("**Year × Month Heatmap**")
+                st.plotly_chart(create_monthly_heatmap(cal.monthly_heatmap),
+                                use_container_width=True, config={'displayModeBar': False})
+            with st.expander("📋 Monthly Table", expanded=False):
+                st.dataframe(cal.monthly_df, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+
+            # ── Day of Month ───────────────────────────────────────────────────
+            if not cal.day_of_month_df.empty:
+                st.markdown("#### 📅 Day-of-Month Effect")
+                st.caption("Average return by calendar day (1–31). Useful for scheduling entries.")
+                st.plotly_chart(create_dom_chart(cal.day_of_month_df), use_container_width=True,
+                                config={'displayModeBar': False})
+                with st.expander("📋 Day-of-Month Table", expanded=False):
+                    st.dataframe(cal.day_of_month_df, use_container_width=True, hide_index=True)
+                st.markdown("---")
+
+            # ── Hourly (intraday only) ─────────────────────────────────────────
+            if cal.is_intraday and cal.hourly_df is not None:
+                st.markdown("#### ⏰ Hourly Returns")
+                st.caption("Average return per hour of day. Computed on 1h bars regardless of input frequency.")
+                st.plotly_chart(create_hourly_chart(cal.hourly_df), use_container_width=True,
+                                config={'displayModeBar': False})
+                with st.expander("📋 Hourly Table", expanded=False):
+                    st.dataframe(cal.hourly_df, use_container_width=True, hide_index=True)
+                st.markdown("---")
+
+            # ── Return Distribution ────────────────────────────────────────────
+            dist = cal.distribution
+            if dist.bins:
+                st.markdown("#### 📊 Return Distribution")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Mean Daily", f"{dist.mean:+.4f}%")
+                c2.metric("Std Dev",    f"{dist.std:.4f}%")
+                c3.metric("Skewness",   f"{dist.skew:.3f}",
+                          help="Negative = left tail heavier (more large down days)")
+                c4.metric("Excess Kurtosis", f"{dist.kurtosis:.3f}",
+                          help="Positive = fat tails (more extreme moves than normal)")
+                st.plotly_chart(create_return_distribution_chart(dist),
+                                use_container_width=True, config={'displayModeBar': False})
+                st.markdown("---")
+
+            # ── Trade Calendar (strategy-level) ───────────────────────────────
+            tc = st.session_state.get('_trade_calendar')
+            if tc and not tc.trades_by_day.empty:
+                st.markdown("#### 🎯 Strategy Trade Calendar")
+                st.caption("Entry day and month analysis from the most recent backtest.")
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**By Entry Day**")
+                    st.dataframe(tc.trades_by_day, use_container_width=True, hide_index=True)
+                with c2:
+                    st.markdown("**By Entry Month**")
+                    st.dataframe(tc.trades_by_month, use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1120,4 +1371,4 @@ with tabs[7]:
 
 
 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
-st.markdown('<p style="text-align:center;color:#64748b;font-size:0.7rem;">Trading Toolkit Pro v7.0</p>', unsafe_allow_html=True)
+st.markdown('<p style="text-align:center;color:#64748b;font-size:0.7rem;">Strategy Lab v7.0</p>', unsafe_allow_html=True)
