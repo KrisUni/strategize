@@ -1,5 +1,5 @@
 """
-Trading Toolkit - Premium UI v7
+Strategy Lab - Premium UI v7
 ================================
 Changes from v6:
 - Optimize tab updated for optimize module v8:
@@ -32,7 +32,7 @@ from src.analytics import analyze_calendar, analyze_trade_calendar
 # ═══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="Trading Toolkit Pro",
+    page_title="Strategy Lab ",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -115,7 +115,8 @@ def get_default_params() -> Dict[str, Any]:
 
 for key, default in [('params', get_default_params()), ('df', None), ('multi_df', {}),
                       ('backtest_results', None), ('optimization_results', None),
-                      ('capital', 10000), ('commission', 0.1)]:
+                      ('capital', 10000), ('commission', 1.0),
+                      ('pinned_params', set())]:   # v9: set of pinned param names
     if key not in st.session_state:
         st.session_state[key] = default
 
@@ -400,7 +401,7 @@ def create_monthly_heatmap(heatmap_df):
 
 p = st.session_state.params
 with st.sidebar:
-    st.markdown("# 📊 Trading Toolkit Pro")
+    st.markdown("# 📊 Strategy Lab ")
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     st.markdown("### 📈 Data")
     data_src = st.radio("Source", ["Yahoo Finance", "Sample", "CSV"], horizontal=True, label_visibility="collapsed")
@@ -408,9 +409,9 @@ with st.sidebar:
     # yfinance API hard limits per interval (calendar days)
     _INTERVAL_MAX_DAYS = {
         '1m': 7, '2m': 60, '5m': 60, '15m': 60, '30m': 60,
-        '90m': 730, '1h': 730,
+        '60m': 730, '90m': 60, '1h': 730,
     }
-    INTERVALS = ["1m","5m","15m","30m","1h","90m","1d","5d","1wk","1mo","3mo"]
+    INTERVALS = ["1m","2m","5m","15m","30m","60m","90m","1h","1d","5d","1wk","1mo","3mo"]
 
     symbol, interval, days = "SPY", "1d", 730
     uploaded_file = None
@@ -612,7 +613,7 @@ st.session_state.params = p
 # MAIN CONTENT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.markdown("# 📊 Trading Toolkit Pro")
+st.markdown("# 📊 Strategy Lab ")
 tabs = st.tabs(["🔬 Backtest", "🎯 Optimize", "⚖️ Compare", "🎲 Monte Carlo", "📅 Calendar", "🔥 Heatmap", "🌐 Multi-Asset", "📋 Trades"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -677,42 +678,166 @@ with tabs[1]:
 
     # ── Row 1: core settings ──────────────────────────────────────────────────
     c1,c2,c3,c4 = st.columns(4)
-    opt_metric = c1.selectbox("Metric", ["sharpe_ratio","total_return_pct","profit_factor","sortino_ratio"])
+    opt_metric = c1.selectbox("Metric", ["profit_factor","sharpe_ratio","total_return_pct","sortino_ratio"])
     opt_dir = c2.selectbox("Dir", ["long_only","short_only","both"])
-    opt_trials = c3.slider("Trials", 20, 500, 100)
+    opt_trials = c3.slider("Trials", 50, 500, 200)
     opt_min = c4.slider("Min Trades", 5, 30, 10)
 
     # ── Row 2: split / WFO settings ──────────────────────────────────────────
     c1,c2,c3 = st.columns(3)
     train_pct = c1.slider("Train %", 50, 90, 70)
-    use_wf = c2.toggle("Walk-Forward", False)
+    use_wf = c2.toggle("Walk-Forward", True)
     n_folds = c3.slider("Folds", 3, 10, 5) if use_wf else 5
 
-    # ── Row 3: WFO-specific controls (only shown when WFO enabled) ────────────
+    # ── Row 3: WFO-specific controls ─────────────────────────────────────────
     window_type = 'rolling'
     train_window_bars = None
     if use_wf:
         c1, c2, c3 = st.columns(3)
         window_type = c1.selectbox(
-            "Window Type",
-            ["rolling", "anchored"],
-            index=0,
+            "Window Type", ["rolling", "anchored"], index=0,
             help="Rolling: fixed-size sliding window (recommended for non-stationary markets). "
-                 "Anchored: expanding from bar 0 (use when you believe the edge is stable across all history)."
+                 "Anchored: expanding from bar 0."
         )
         if window_type == 'rolling' and st.session_state.df is not None:
             default_bars = int(len(st.session_state.df) * train_pct / 100)
             train_window_bars = c2.slider(
-                "Train Window (bars)",
-                min_value=50,
+                "Train Window (bars)", min_value=50,
                 max_value=max(51, len(st.session_state.df) - 20),
                 value=min(default_bars, max(50, len(st.session_state.df) - 20)),
-                help="Number of bars in each fold's training window. "
-                     "Smaller = more responsive to recent regimes. "
-                     "Larger = more stable but slower to adapt."
             )
         elif window_type == 'rolling':
             c2.caption("Load data to configure window size.")
+
+    # ── Pin Parameters panel ──────────────────────────────────────────────────
+    # Full catalogue of params that can be pinned per indicator.
+    # Only indicators that are currently enabled appear in the panel.
+    _PINNABLE: Dict[str, list] = {
+        'pamrp_enabled': [
+            ('pamrp_length',      'Length'),
+            ('pamrp_entry_long',  'Entry Long'),
+            ('pamrp_entry_short', 'Entry Short'),
+            ('pamrp_exit_long',   'Exit Long'),
+            ('pamrp_exit_short',  'Exit Short'),
+        ],
+        'bbwp_enabled': [
+            ('bbwp_length',          'Length'),
+            ('bbwp_lookback',        'Lookback'),
+            ('bbwp_sma_length',      'SMA Length'),
+            ('bbwp_ma_filter',       'MA Filter'),
+            ('bbwp_threshold_long',  'Threshold Long'),
+            ('bbwp_threshold_short', 'Threshold Short'),
+        ],
+        'adx_enabled': [
+            ('adx_length',    'Length'),
+            ('adx_smoothing', 'Smoothing'),
+            ('adx_threshold', 'Threshold'),
+        ],
+        'ma_trend_enabled': [
+            ('ma_type',        'Type'),
+            ('ma_fast_length', 'Fast Length'),
+            ('ma_slow_length', 'Slow Length'),
+        ],
+        'rsi_enabled': [
+            ('rsi_length',    'Length'),
+            ('rsi_oversold',  'Oversold'),
+            ('rsi_overbought','Overbought'),
+        ],
+        'volume_enabled': [
+            ('volume_ma_length',  'MA Length'),
+            ('volume_multiplier', 'Multiplier'),
+        ],
+        'supertrend_enabled': [
+            ('supertrend_period',     'Period'),
+            ('supertrend_multiplier', 'Multiplier'),
+        ],
+        'macd_enabled': [
+            ('macd_fast',   'Fast'),
+            ('macd_slow',   'Slow'),
+            ('macd_signal', 'Signal'),
+        ],
+        'stop_loss_enabled': [
+            ('stop_loss_pct_long',  '% Long'),
+            ('stop_loss_pct_short', '% Short'),
+        ],
+        'take_profit_enabled': [
+            ('take_profit_pct_long',  '% Long'),
+            ('take_profit_pct_short', '% Short'),
+        ],
+        'trailing_stop_enabled': [
+            ('trailing_stop_pct', 'Trail %'),
+        ],
+        'atr_trailing_enabled': [
+            ('atr_length',     'Length'),
+            ('atr_multiplier', 'Multiplier'),
+        ],
+        'time_exit_enabled': [
+            ('time_exit_bars', 'Max Bars'),
+        ],
+        'ma_exit_enabled': [
+            ('ma_exit_fast', 'Fast'),
+            ('ma_exit_slow', 'Slow'),
+        ],
+        'bbwp_exit_enabled': [
+            ('bbwp_exit_threshold', 'Threshold'),
+        ],
+    }
+
+    # Indicator display names for the panel header
+    _INDICATOR_LABELS: Dict[str, str] = {
+        'pamrp_enabled': 'PAMRP', 'bbwp_enabled': 'BBWP', 'adx_enabled': 'ADX',
+        'ma_trend_enabled': 'MA Trend', 'rsi_enabled': 'RSI', 'volume_enabled': 'Volume',
+        'supertrend_enabled': 'Supertrend', 'macd_enabled': 'MACD',
+        'stop_loss_enabled': 'Stop Loss', 'take_profit_enabled': 'Take Profit',
+        'trailing_stop_enabled': 'Trailing Stop', 'atr_trailing_enabled': 'ATR Trail',
+        'time_exit_enabled': 'Time Exit', 'ma_exit_enabled': 'MA Exit',
+        'bbwp_exit_enabled': 'BBWP Exit',
+    }
+
+    # Only show indicators that are enabled in the sidebar
+    enabled_pinnable = [
+        (ind_key, _INDICATOR_LABELS.get(ind_key, ind_key), params_list)
+        for ind_key, params_list in _PINNABLE.items()
+        if st.session_state.params.get(ind_key, False)
+    ]
+
+    pinned_set: set = st.session_state.pinned_params  # mutated in place
+
+    if enabled_pinnable:
+        with st.expander("🔒 Pin Parameters (hold fixed during optimization)", expanded=False):
+            st.caption(
+                "Checked parameters are fixed at their current sidebar values and excluded "
+                "from the search space. Fewer free parameters = better TPE convergence."
+            )
+            if st.button("Clear all pins", key="_clear_pins"):
+                st.session_state.pinned_params = set()
+                st.rerun()
+
+            for ind_key, ind_label, param_list in enabled_pinnable:
+                st.markdown(f"**{ind_label}**")
+                cols = st.columns(min(len(param_list), 3))
+                for idx, (pname, plabel) in enumerate(param_list):
+                    current_val = st.session_state.params.get(pname, '—')
+                    col = cols[idx % len(cols)]
+                    checked = col.checkbox(
+                        f"{plabel}  `{current_val}`",
+                        value=(pname in pinned_set),
+                        key=f"_pin_{pname}",
+                    )
+                    if checked:
+                        pinned_set.add(pname)
+                    else:
+                        pinned_set.discard(pname)
+        st.session_state.pinned_params = pinned_set
+
+        if pinned_set:
+            pinned_names = ', '.join(
+                next((pl for pk, pl in p_list if pk == k), k)
+                for ind_key, _, p_list in enabled_pinnable
+                for k in pinned_set
+                if any(pk == k for pk, _ in p_list)
+            )
+            st.caption(f"🔒 Pinned: **{pinned_names}**")
 
     # ── Active indicators display ─────────────────────────────────────────────
     active_display = get_active_filters_display(st.session_state.params)
@@ -725,6 +850,12 @@ with tabs[1]:
             st.warning("Load data first!")
         else:
             ef = {k: v for k, v in st.session_state.params.items() if k.endswith('_enabled')}
+            # Build pinned_params dict: name → current sidebar value
+            pinned_dict = {
+                k: st.session_state.params[k]
+                for k in st.session_state.pinned_params
+                if k in st.session_state.params
+            }
             with st.spinner("Optimizing..."):
                 res = optimize_strategy(
                     df=st.session_state.df.copy(),
@@ -741,6 +872,7 @@ with tabs[1]:
                     window_type=window_type,
                     train_window_bars=train_window_bars,
                     show_progress=False,
+                    pinned_params=pinned_dict if pinned_dict else None,
                 )
                 st.session_state.optimization_results = res
                 st.success("✅ Done!")
@@ -750,7 +882,7 @@ with tabs[1]:
         res = st.session_state.optimization_results
         ml = res.metric.replace('_', ' ').title()
 
-        # Warnings — shown first so user sees them before metrics
+        # Warnings — shown first
         if res.warnings:
             with st.expander(f"⚠️ {len(res.warnings)} Robustness Warning(s)", expanded=True):
                 for w in res.warnings:
@@ -760,50 +892,44 @@ with tabs[1]:
         c1,c2,c3,c4 = st.columns(4)
         c1.metric(f"Train ({ml})", f"{res.train_value:.4f}")
         c2.metric(f"OOS ({ml})", f"{res.test_value:.4f}")
-
-        # Efficiency ratio: color-code the degradation
         if res.train_value != 0 and res.efficiency_ratio != 0.0:
-            eff_label = f"{res.efficiency_ratio:.2f}"
-            eff_delta = None
             if res.efficiency_ratio < 0.5:
-                c3.metric("Efficiency (OOS/IS)", eff_label, delta="⚠ Overfit risk", delta_color="inverse")
+                c3.metric("Efficiency (OOS/IS)", f"{res.efficiency_ratio:.2f}", delta="⚠ Overfit risk", delta_color="inverse")
             else:
-                c3.metric("Efficiency (OOS/IS)", eff_label, delta="✓ Acceptable", delta_color="normal")
+                c3.metric("Efficiency (OOS/IS)", f"{res.efficiency_ratio:.2f}", delta="✓ Acceptable", delta_color="normal")
         else:
             c3.metric("Efficiency (OOS/IS)", "—")
-
         if res.train_value > 0:
             deg = ((res.train_value - res.test_value) / res.train_value) * 100
-            c4.metric("IS→OOS Degradation", f"{deg:.1f}%",
-                      delta_color="normal" if deg < 30 else "inverse")
+            c4.metric("IS→OOS Degradation", f"{deg:.1f}%", delta_color="normal" if deg < 30 else "inverse")
 
-        # Walk-forward fold chart + stitched equity
+        # Walk-forward charts
         if res.walkforward_folds:
             st.markdown("#### Walk-Forward Fold Performance")
             st.caption(f"Window: **{res.window_type}** | Folds: **{len(res.walkforward_folds)}**")
             st.plotly_chart(create_walkforward_chart(res.walkforward_folds),
                             use_container_width=True, config={'displayModeBar': False})
-
-            # Stitched OOS equity — the authoritative performance chart for WFO
             if res.stitched_equity is not None and len(res.stitched_equity) > 0:
                 st.markdown("#### 📈 Stitched OOS Equity Curve")
-                st.caption(
-                    "Each segment is a genuine out-of-sample period. "
-                    "This is the only unbiased performance representation for walk-forward optimization."
-                )
-                st.plotly_chart(create_stitched_equity_chart(res.stitched_equity),
-                                use_container_width=True)
+                st.caption("Each segment is a genuine out-of-sample period — the only unbiased performance view for WFO.")
+                st.plotly_chart(create_stitched_equity_chart(res.stitched_equity), use_container_width=True)
 
         # Best params + full-data performance
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("### Best Params")
-            st.dataframe(pd.DataFrame([{"Parameter": k, "Value": str(v)[:25]}
-                for k, v in res.best_params.items()
-                if not k.startswith('trade_direction') and not isinstance(v, TradeDirection)]),
-                use_container_width=True, hide_index=True, height=250)
+            # Mark pinned params visually
+            pp = res.pinned_params or {}
+            rows = []
+            for k, v in res.best_params.items():
+                if k.startswith('trade_direction') or isinstance(v, TradeDirection):
+                    continue
+                locked = "🔒 " if k in pp else ""
+                rows.append({"Parameter": f"{locked}{k}", "Value": str(v)[:25]})
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=280)
+            if pp:
+                st.caption(f"🔒 = fixed at sidebar value ({len(pp)} pinned)")
         with c2:
-            # v8: renamed from best_results → full_data_results
             br = res.full_data_results
             st.markdown("### Full-Data Performance")
             st.caption("⚠ Includes in-sample periods. For WFO, refer to the stitched OOS chart above.")
@@ -815,10 +941,8 @@ with tabs[1]:
                 {"Metric": "Trades",   "Value": str(br.num_trades)},
             ]), use_container_width=True, hide_index=True)
 
-        # Trial convergence chart (simple split only — WFO has no single trial list)
         if not res.all_trials.empty:
-            st.plotly_chart(create_optimization_chart(res.all_trials, res.metric),
-                            use_container_width=True)
+            st.plotly_chart(create_optimization_chart(res.all_trials, res.metric), use_container_width=True)
 
         st.button("📋 Apply Best Params", on_click=apply_best_params_callback, use_container_width=True)
         if st.session_state.pop('_apply_success', False):

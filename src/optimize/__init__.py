@@ -185,16 +185,21 @@ class OptimizationResult:
     failed_trial_pct: float = 0.0
     warnings: List[str] = field(default_factory=list)
     window_type: str = 'rolling'
+    pinned_params: Dict[str, Any] = field(default_factory=dict)   # v9: params fixed by user
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _count_active_params(enabled_filters: Dict[str, bool]) -> int:
+def _count_active_params(
+    enabled_filters: Dict[str, bool],
+    pinned_params: Optional[Dict[str, Any]] = None,
+) -> int:
     """
     Estimate numeric parameters that will be optimized.
     Each enabled indicator contributes an approximate dimension count.
+    Pinned params are subtracted — they consume no trial dimensions.
     """
     dims_per_indicator = {
         'pamrp_enabled': 5,
@@ -220,7 +225,9 @@ def _count_active_params(enabled_filters: Dict[str, bool]) -> int:
         dims_per_indicator.get(k, 2)
         for k, v in enabled_filters.items() if v
     )
-    return max(total, 1)
+    # Each pinned param removes one dimension from the search space
+    n_pinned = len(pinned_params) if pinned_params else 0
+    return max(total - n_pinned, 1)
 
 
 def _count_enabled_indicators(enabled_filters: Dict[str, bool]) -> int:
@@ -236,9 +243,10 @@ def _count_enabled_indicators(enabled_filters: Dict[str, bool]) -> int:
 def _build_trial_budget_warnings(
     n_trials: int,
     enabled_filters: Dict[str, bool],
+    pinned_params: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     msgs = []
-    active_dims = _count_active_params(enabled_filters)
+    active_dims = _count_active_params(enabled_filters, pinned_params)
     min_recommended = active_dims * 10
     n_indicators = _count_enabled_indicators(enabled_filters)
 
@@ -407,6 +415,13 @@ class BayesianOptimizer:
     window_type : str  — 'rolling' or 'anchored'
     train_window_bars : int | None
         Rolling window size. Defaults to int(len(df) * train_pct).
+    pinned_params : dict[str, Any] | None
+        Parameters to hold fixed at their given values during optimization.
+        Any param name listed here is NOT passed to trial.suggest_* —
+        its value is taken directly from this dict instead.
+        Example: {'pamrp_length': 21, 'bbwp_lookback': 252}
+        Pinned params reduce the effective search-space dimensionality,
+        which improves TPE convergence for the remaining free params.
     """
 
     def __init__(
@@ -423,6 +438,7 @@ class BayesianOptimizer:
         n_folds: int = 5,
         window_type: str = 'rolling',
         train_window_bars: Optional[int] = None,
+        pinned_params: Optional[Dict[str, Any]] = None,   # v9
     ):
         self.df = df
         self.enabled_filters = enabled_filters
@@ -435,6 +451,7 @@ class BayesianOptimizer:
         self.n_folds = n_folds
         self.window_type = window_type
         self.trade_direction_str = trade_direction
+        self.pinned_params: Dict[str, Any] = pinned_params or {}   # v9
         self.trade_direction = {
             'long_only': TradeDirection.LONG_ONLY,
             'short_only': TradeDirection.SHORT_ONLY,
@@ -465,81 +482,102 @@ class BayesianOptimizer:
     # ── Parameter builder ─────────────────────────────────────────────────────
 
     def _build_params_from_trial(self, trial) -> StrategyParams:
-        """Build StrategyParams — only optimize enabled filters."""
+        """
+        Build StrategyParams from an Optuna trial.
+
+        For each parameter, if it is listed in self.pinned_params, its pinned
+        value is used directly without calling trial.suggest_*.  This removes
+        the parameter from the search space, reducing effective dimensionality
+        and improving TPE convergence for the remaining free params.
+        """
+        pp = self.pinned_params  # dict of {param_name: fixed_value}
+
+        # Local helpers — check pin first, fall back to Optuna suggest
+        def p_int(name: str, lo: int, hi: int) -> int:
+            return int(pp[name]) if name in pp else trial.suggest_int(name, lo, hi)
+
+        def p_float(name: str, lo: float, hi: float) -> float:
+            return float(pp[name]) if name in pp else trial.suggest_float(name, lo, hi)
+
+        def p_cat(name: str, choices: list):
+            return pp[name] if name in pp else trial.suggest_categorical(name, choices)
+
         ef = self.enabled_filters
+        long_or_both  = self.trade_direction in [TradeDirection.LONG_ONLY,  TradeDirection.BOTH]
+        short_or_both = self.trade_direction in [TradeDirection.SHORT_ONLY, TradeDirection.BOTH]
 
-        pe = ef.get('pamrp_enabled', True)
-        pl = trial.suggest_int('pamrp_length', 10, 30) if pe else 21
-        pel = trial.suggest_int('pamrp_entry_long', 10, 40) if pe and self.trade_direction in [TradeDirection.LONG_ONLY, TradeDirection.BOTH] else 20
-        pxl = trial.suggest_int('pamrp_exit_long', 55, 90) if pe and self.trade_direction in [TradeDirection.LONG_ONLY, TradeDirection.BOTH] else 70
-        pes = trial.suggest_int('pamrp_entry_short', 60, 90) if pe and self.trade_direction in [TradeDirection.SHORT_ONLY, TradeDirection.BOTH] else 80
-        pxs = trial.suggest_int('pamrp_exit_short', 10, 45) if pe and self.trade_direction in [TradeDirection.SHORT_ONLY, TradeDirection.BOTH] else 30
+        pe  = ef.get('pamrp_enabled', True)
+        pl  = p_int('pamrp_length',      10,  30) if pe else 21
+        pel = p_int('pamrp_entry_long',  10,  40) if pe and long_or_both  else 20
+        pxl = p_int('pamrp_exit_long',   55,  90) if pe and long_or_both  else 70
+        pes = p_int('pamrp_entry_short', 60,  90) if pe and short_or_both else 80
+        pxs = p_int('pamrp_exit_short',  10,  45) if pe and short_or_both else 30
 
-        be = ef.get('bbwp_enabled', True)
-        bl = trial.suggest_int('bbwp_length', 8, 21) if be else 13
-        blb = trial.suggest_int('bbwp_lookback', 100, 300) if be else 252
-        bsma = trial.suggest_int('bbwp_sma_length', 3, 10) if be else 5
-        bmf = trial.suggest_categorical('bbwp_ma_filter', ['disabled', 'decreasing']) if be else 'disabled'
-        btl = trial.suggest_int('bbwp_threshold_long', 30, 70) if be and self.trade_direction in [TradeDirection.LONG_ONLY, TradeDirection.BOTH] else 50
-        bts = trial.suggest_int('bbwp_threshold_short', 30, 70) if be and self.trade_direction in [TradeDirection.SHORT_ONLY, TradeDirection.BOTH] else 50
+        be   = ef.get('bbwp_enabled', True)
+        bl   = p_int('bbwp_length',         8,   21) if be else 13
+        blb  = p_int('bbwp_lookback',      100,  300) if be else 252
+        bsma = p_int('bbwp_sma_length',     3,   10) if be else 5
+        bmf  = p_cat('bbwp_ma_filter', ['disabled', 'decreasing']) if be else 'disabled'
+        btl  = p_int('bbwp_threshold_long',  30,  70) if be and long_or_both  else 50
+        bts  = p_int('bbwp_threshold_short', 30,  70) if be and short_or_both else 50
 
-        ae = ef.get('adx_enabled', False)
-        al = trial.suggest_int('adx_length', 10, 20) if ae else 14
-        asm = trial.suggest_int('adx_smoothing', 10, 20) if ae else 14
-        at = trial.suggest_int('adx_threshold', 15, 35) if ae else 20
+        ae  = ef.get('adx_enabled', False)
+        al  = p_int('adx_length',    10, 20) if ae else 14
+        asm = p_int('adx_smoothing', 10, 20) if ae else 14
+        at  = p_int('adx_threshold', 15, 35) if ae else 20
 
         mae = ef.get('ma_trend_enabled', False)
-        maf = trial.suggest_int('ma_fast_length', 20, 100) if mae else 50
-        mas = trial.suggest_int('ma_slow_length', 100, 300) if mae else 200
-        mat = trial.suggest_categorical('ma_type', ['sma', 'ema']) if mae else 'sma'
+        maf = p_int('ma_fast_length',  20, 100) if mae else 50
+        mas = p_int('ma_slow_length', 100, 300) if mae else 200
+        mat = p_cat('ma_type', ['sma', 'ema'])  if mae else 'sma'
 
-        re = ef.get('rsi_enabled', False)
-        rl = trial.suggest_int('rsi_length', 7, 21) if re else 14
-        ros = trial.suggest_int('rsi_oversold', 20, 40) if re else 30
-        rob = trial.suggest_int('rsi_overbought', 60, 80) if re else 70
+        re  = ef.get('rsi_enabled', False)
+        rl  = p_int('rsi_length',    7,  21) if re else 14
+        ros = p_int('rsi_oversold',  20, 40) if re else 30
+        rob = p_int('rsi_overbought', 60, 80) if re else 70
 
-        ve = ef.get('volume_enabled', False)
-        vml = trial.suggest_int('volume_ma_length', 10, 30) if ve else 20
-        vm = trial.suggest_float('volume_multiplier', 0.8, 1.5) if ve else 1.0
+        ve  = ef.get('volume_enabled', False)
+        vml = p_int('volume_ma_length',  10,  30) if ve else 20
+        vm  = p_float('volume_multiplier', 0.8, 1.5) if ve else 1.0
 
         ste = ef.get('supertrend_enabled', False)
-        stp = trial.suggest_int('supertrend_period', 7, 14) if ste else 10
-        stm = trial.suggest_float('supertrend_multiplier', 2.0, 4.0) if ste else 3.0
+        stp = p_int('supertrend_period',         7,   14) if ste else 10
+        stm = p_float('supertrend_multiplier', 2.0,  4.0) if ste else 3.0
 
         vwe = ef.get('vwap_enabled', False)
 
-        mce = ef.get('macd_enabled', False)
-        mcf = trial.suggest_int('macd_fast', 8, 15) if mce else 12
-        mcs = trial.suggest_int('macd_slow', 20, 30) if mce else 26
-        mcsi = trial.suggest_int('macd_signal', 6, 12) if mce else 9
+        mce  = ef.get('macd_enabled', False)
+        mcf  = p_int('macd_fast',    8,  15) if mce else 12
+        mcs  = p_int('macd_slow',   20,  30) if mce else 26
+        mcsi = p_int('macd_signal',  6,  12) if mce else 9
 
         sle = ef.get('stop_loss_enabled', True)
-        sll = trial.suggest_float('stop_loss_pct_long', 1.0, 10.0) if sle else 3.0
-        sls = trial.suggest_float('stop_loss_pct_short', 1.0, 10.0) if sle else 3.0
+        sll = p_float('stop_loss_pct_long',  1.0, 10.0) if sle else 3.0
+        sls = p_float('stop_loss_pct_short', 1.0, 10.0) if sle else 3.0
 
         tpe = ef.get('take_profit_enabled', False)
-        tpl = trial.suggest_float('take_profit_pct_long', 2.0, 15.0) if tpe else 5.0
-        tps = trial.suggest_float('take_profit_pct_short', 2.0, 15.0) if tpe else 5.0
+        tpl = p_float('take_profit_pct_long',  2.0, 15.0) if tpe else 5.0
+        tps = p_float('take_profit_pct_short', 2.0, 15.0) if tpe else 5.0
 
         tse = ef.get('trailing_stop_enabled', False)
-        tsp = trial.suggest_float('trailing_stop_pct', 1.0, 5.0) if tse else 2.0
+        tsp = p_float('trailing_stop_pct', 1.0, 5.0) if tse else 2.0
 
         ate = ef.get('atr_trailing_enabled', False)
-        atl = trial.suggest_int('atr_length', 10, 20) if ate else 14
-        atm = trial.suggest_float('atr_multiplier', 1.5, 4.0) if ate else 2.0
+        atl = p_int('atr_length',         10,  20) if ate else 14
+        atm = p_float('atr_multiplier', 1.5, 4.0) if ate else 2.0
 
         pxe = ef.get('pamrp_exit_enabled', True)
         sre = ef.get('stoch_rsi_exit_enabled', False)
 
         txe = ef.get('time_exit_enabled', False)
-        txb = trial.suggest_int('time_exit_bars', 10, 50) if txe else 20
+        txb = p_int('time_exit_bars', 10, 50) if txe else 20
 
         mxe = ef.get('ma_exit_enabled', False)
-        mxf = trial.suggest_int('ma_exit_fast', 5, 15) if mxe else 10
-        mxs = trial.suggest_int('ma_exit_slow', 15, 30) if mxe else 20
+        mxf = p_int('ma_exit_fast',  5, 15) if mxe else 10
+        mxs = p_int('ma_exit_slow', 15, 30) if mxe else 20
 
         bxe = ef.get('bbwp_exit_enabled', False)
-        bxt = trial.suggest_int('bbwp_exit_threshold', 70, 90) if bxe else 80
+        bxt = p_int('bbwp_exit_threshold', 70, 90) if bxe else 80
 
         has_exit = any([sle, tpe, tse, ate, pxe, sre, txe, mxe, bxe])
         if not has_exit:
@@ -664,8 +702,7 @@ class BayesianOptimizer:
 
         Per-fold trial budget: n_trials divided across folds, floor of 50.
         """
-        budget_warnings = _build_trial_budget_warnings(n_trials, self.enabled_filters)
-
+        budget_warnings = _build_trial_budget_warnings(n_trials, self.enabled_filters, self.pinned_params)
         fold_windows = self._get_fold_windows()
         n_active_folds = len(fold_windows)
         # v8: floor raised from 30 → 50 (TPE needs ~20 warmup + meaningful exploration)
@@ -767,6 +804,7 @@ class BayesianOptimizer:
             failed_trial_pct=avg_failed_pct,
             warnings=all_warnings,
             window_type=self.window_type,
+            pinned_params=self.pinned_params,
         )
 
     # ── Simple train/test split ───────────────────────────────────────────────
@@ -775,7 +813,7 @@ class BayesianOptimizer:
         self, n_trials: int, show_progress: bool, timeout: Optional[float]
     ) -> OptimizationResult:
         """Standard single train/test split optimization (non-WF)."""
-        budget_warnings = _build_trial_budget_warnings(n_trials, self.enabled_filters)
+        budget_warnings = _build_trial_budget_warnings(n_trials, self.enabled_filters, self.pinned_params)
 
         exception_counter = [0]
         sampler = TPESampler(seed=42)
@@ -801,6 +839,7 @@ class BayesianOptimizer:
                 all_trials=pd.DataFrame(), metric=self.metric,
                 initial_capital=self.initial_capital, commission_pct=self.commission_pct,
                 failed_trial_pct=failed_pct, warnings=all_warnings, window_type='simple',
+                pinned_params=self.pinned_params,
             )
 
         params = self._build_params_from_trial(study.best_trial)
@@ -846,6 +885,7 @@ class BayesianOptimizer:
             failed_trial_pct=failed_pct,
             warnings=all_warnings,
             window_type='simple',
+            pinned_params=self.pinned_params,
         )
 
     # ── Entry point ───────────────────────────────────────────────────────────
@@ -874,15 +914,16 @@ def optimize_strategy(
     n_trials: int = 200,
     min_trades: int = 10,
     initial_capital: float = 10000,
-    commission_pct: float = 1,
+    commission_pct: float = 0.1,
     trade_direction: str = 'long_only',
     train_pct: float = 0.7,
-    use_walkforward: bool = True,
+    use_walkforward: bool = False,
     n_folds: int = 5,
     show_progress: bool = True,
     window_type: str = 'rolling',
     train_window_bars: Optional[int] = None,
     timeout: Optional[float] = None,
+    pinned_params: Optional[Dict[str, Any]] = None,   # v9
 ) -> OptimizationResult:
     """
     Convenience wrapper around BayesianOptimizer.
@@ -892,6 +933,15 @@ def optimize_strategy(
     window_type : 'rolling' (default) or 'anchored'
     train_window_bars : int | None — rolling window size in bars
     timeout : float | None — per-study time limit in seconds
+
+    Parameters added in v9
+    ----------------------
+    pinned_params : dict[str, Any] | None
+        Parameters to hold fixed during optimization.
+        Keys are StrategyParams field names; values are the fixed values.
+        Pinned params are excluded from trial.suggest_* calls, reducing
+        search-space dimensionality and improving TPE convergence.
+        Example: {'pamrp_length': 21, 'stop_loss_pct_long': 3.0}
 
     All other parameters are backward compatible with v6.
     """
@@ -908,5 +958,6 @@ def optimize_strategy(
         n_folds=n_folds,
         window_type=window_type,
         train_window_bars=train_window_bars,
+        pinned_params=pinned_params,
     )
     return opt.optimize(n_trials=n_trials, timeout=timeout, show_progress=show_progress)
