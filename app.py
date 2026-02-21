@@ -20,7 +20,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 
-from src.data import fetch_yfinance, generate_sample_data
+from src.data import fetch_yfinance, generate_sample_data, load_csv
 from src.strategy import StrategyParams, SignalGenerator, TradeDirection
 from src.backtest import BacktestEngine, BacktestResults
 from src.optimize import optimize_strategy
@@ -403,25 +403,111 @@ with st.sidebar:
     st.markdown("# 📊 Trading Toolkit Pro")
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     st.markdown("### 📈 Data")
-    data_src = st.radio("Source", ["Yahoo Finance", "Sample"], horizontal=True, label_visibility="collapsed")
-    INTERVALS = ["1m","5m","15m","30m","1h","1d","1wk","1mo"]
+    data_src = st.radio("Source", ["Yahoo Finance", "Sample", "CSV"], horizontal=True, label_visibility="collapsed")
+
+    # yfinance API hard limits per interval (calendar days)
+    _INTERVAL_MAX_DAYS = {
+        '1m': 7, '2m': 60, '5m': 60, '15m': 60, '30m': 60,
+        '90m': 730, '1h': 730,
+    }
+    INTERVALS = ["1m","5m","15m","30m","1h","90m","1d","5d","1wk","1mo","3mo"]
+
+    symbol, interval, days = "SPY", "1d", 730
+    uploaded_file = None
+
     if data_src == "Yahoo Finance":
         symbol = st.text_input("Symbol", "SPY")
         c1, c2 = st.columns(2)
-        interval = c1.selectbox("Interval", INTERVALS, index=5)
-        days = c2.number_input("Days", 30, 2000, 730)
-    else:
-        symbol, interval, days = "SAMPLE", "1d", 500
+        interval = c1.selectbox("Interval", INTERVALS, index=INTERVALS.index("1d"))
+        max_days = _INTERVAL_MAX_DAYS.get(interval)
+        if max_days:
+            # Intraday: cap the slider and show the API limit clearly
+            days = c2.slider(
+                "Days",
+                min_value=1,
+                max_value=max_days,
+                value=min(max_days, 60),
+                help=f"Yahoo Finance only provides the last **{max_days} calendar days** for `{interval}` data."
+            )
+            st.caption(f"⚠️ `{interval}` data limited to last **{max_days} days** by Yahoo Finance API.")
+        else:
+            days = c2.number_input("Days", 30, 7300, 730)
+
+    elif data_src == "Sample":
+        c1, c2 = st.columns(2)
+        days = c1.number_input("Bars", 100, 5000, 500)
+        sample_vol = c2.slider("Volatility", 0.005, 0.04, 0.015, 0.005,
+                               help="Daily return std dev. 0.015 ≈ typical equity.")
+
+    else:  # CSV
+        uploaded_file = st.file_uploader(
+            "Upload CSV",
+            type=["csv"],
+            help="Expected columns: date, open, high, low, close[, volume]. "
+                 "Date column must be parseable as datetime."
+        )
+
     if st.button("📥 Load", use_container_width=True):
         with st.spinner("Loading..."):
             try:
                 if data_src == "Yahoo Finance":
-                    end = datetime.now(); start = end - timedelta(days=days)
-                    df = fetch_yfinance(symbol, str(start.date()), str(end.date()), interval)
-                else:
-                    df = generate_sample_data(500)
-                st.session_state.df = df; st.success(f"✅ {len(df)} bars")
-            except Exception as e: st.error(str(e)[:50])
+                    end_dt = datetime.now()
+                    start_dt = end_dt - timedelta(days=days)
+                    df = fetch_yfinance(
+                        symbol,
+                        str(start_dt.date()),
+                        str(end_dt.date()),
+                        interval,
+                    )
+                    st.session_state.df = df
+
+                    # Surface clamping warning if date range was adjusted
+                    if df.attrs.get('date_range_clamped'):
+                        st.warning(
+                            f"⚠️ Date range clamped: `{interval}` data is limited to "
+                            f"the last **{df.attrs['max_interval_days']} calendar days**. "
+                            f"Loaded: **{df.attrs['actual_start']}** → **{df.attrs['actual_end']}**."
+                        )
+                    else:
+                        st.success(
+                            f"✅ **{len(df):,} bars** · "
+                            f"{df.attrs['actual_start']} → {df.attrs['actual_end']}"
+                        )
+
+                elif data_src == "Sample":
+                    df = generate_sample_data(
+                        days=int(days),
+                        volatility=sample_vol,
+                        seed=42,
+                    )
+                    st.session_state.df = df
+                    st.success(
+                        f"✅ **{len(df):,} bars** synthetic · "
+                        f"{df.attrs['actual_start']} → {df.attrs['actual_end']}"
+                    )
+
+                else:  # CSV
+                    if uploaded_file is None:
+                        st.warning("Please upload a CSV file first.")
+                    else:
+                        import tempfile, os
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+                            tmp.write(uploaded_file.getvalue())
+                            tmp_path = tmp.name
+                        try:
+                            df = load_csv(tmp_path)
+                            st.session_state.df = df
+                            st.success(
+                                f"✅ **{len(df):,} bars** from CSV · "
+                                f"{str(df.index[0].date())} → {str(df.index[-1].date())}"
+                            )
+                        finally:
+                            os.unlink(tmp_path)
+
+            except ValueError as e:
+                st.error(str(e))
+            except Exception as e:
+                st.error(f"Unexpected error: {str(e)}")
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     st.markdown("### ⚙️ Strategy")
     p['trade_direction'] = st.selectbox("Direction", ["Long Only","Short Only","Both"], index=["Long Only","Short Only","Both"].index(p['trade_direction']))
